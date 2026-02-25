@@ -1,0 +1,15 @@
+# Voice model files (too large for git — auto-downloaded at runtime)
+voices/*.onnx
+voices/*.onnx.json
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environment
+.venv/
+venv/
+
+# HuggingFace model cache
+.cache/

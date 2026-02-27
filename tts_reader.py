@@ -22,7 +22,16 @@ import logging
 import warnings
 import threading
 import winsound
+import ctypes
 import tkinter as tk
+
+# Tell Windows we handle DPI ourselves — give us real pixel coordinates.
+# Without this, multi-monitor setups with different scaling factors report
+# wrong coordinates, causing screenshots to capture the wrong area.
+try:
+    ctypes.windll.user32.SetProcessDPIAware()
+except Exception:
+    pass
 
 # Suppress noisy warnings from libraries before importing them
 warnings.filterwarnings("ignore", category=UserWarning, module="torch")
@@ -53,8 +62,10 @@ except ImportError:
 TTS_ENGINE = "kokoro"
 
 # Hotkeys
-HOTKEY_READ = "ctrl+alt+r"     # Read selected text aloud
-HOTKEY_OCR = "ctrl+alt+o"      # OCR a screen region, then read aloud
+HOTKEY_READ = "ctrl+alt+r"          # Read selected text aloud
+HOTKEY_OCR = "ctrl+alt+o"           # OCR a screen region, then read aloud
+HOTKEY_SPEED_UP = "ctrl+alt+right"      # Increase speech speed
+HOTKEY_SPEED_DOWN = "ctrl+alt+left"     # Decrease speech speed
 
 # --- Kokoro settings (only used when TTS_ENGINE = "kokoro") ---
 KOKORO_VOICE = "af_heart"      # Voice name (54 choices, see README)
@@ -79,6 +90,7 @@ tts_engine_obj = None          # The loaded TTS model (Kokoro pipeline or Piper 
 tray_icon = None               # System tray icon
 should_quit = False            # Signal to exit the program
 ocr_requested = False          # Flag: main loop should open the region selector
+current_speed = KOKORO_SPEED   # Current speech speed (can be changed with hotkeys)
 
 
 # ---------------------------------------------------------------------------
@@ -273,20 +285,171 @@ def ensure_piper_model():
 
 
 # ---------------------------------------------------------------------------
+# Text cleanup (prepare text for natural-sounding speech)
+# ---------------------------------------------------------------------------
+import re
+
+def clean_text_for_speech(text):
+    """Clean up text so line breaks become natural pauses when spoken.
+
+    The TTS engine treats line breaks as just a space, so text like:
+        "Line one\\nLine two"
+    gets read as one long sentence. This function adds punctuation at
+    line endings so the TTS engine pauses naturally.
+    """
+    # Split into lines, keeping track of blank lines (paragraph breaks)
+    lines = text.splitlines()
+
+    # Characters that already signal a pause to the TTS engine
+    pause_punctuation = ".!?;:,"
+
+    cleaned_parts = []
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+
+        # Skip blank lines but mark a paragraph break
+        if not stripped:
+            # Only add a paragraph break if we already have some text
+            if cleaned_parts:
+                cleaned_parts.append("\n\n")
+            continue
+
+        # If the line doesn't end with punctuation, add a period
+        if stripped and stripped[-1] not in pause_punctuation:
+            stripped += "."
+
+        cleaned_parts.append(stripped)
+
+    # Join everything with spaces (paragraph breaks are already "\n\n")
+    result = ""
+    for part in cleaned_parts:
+        if part == "\n\n":
+            result += "\n\n"
+        elif result and not result.endswith("\n"):
+            result += " " + part
+        else:
+            result += part
+
+    return result.strip()
+
+
+# ---------------------------------------------------------------------------
+# Time-stretching (speed up audio without changing pitch or losing clarity)
+# ---------------------------------------------------------------------------
+def time_stretch_wsola(audio, rate, sample_rate):
+    """Speed up or slow down audio using WSOLA (Waveform Similarity Overlap-Add).
+
+    Unlike the phase vocoder method (used by librosa), WSOLA works directly
+    on the sound wave rather than in the frequency domain. This preserves the
+    natural timbre of the voice — no hollow or metallic artifacts.
+
+    How it works:
+    1. Split the audio into overlapping windows (50ms each)
+    2. For each window, search nearby for the best splice point where the
+       waveform naturally lines up (using cross-correlation)
+    3. Overlap-add the windows at closer spacing (for speedup) or wider
+       spacing (for slowdown)
+
+    The result is faster speech that sounds natural — same pitch, same voice
+    quality, just less time between syllables.
+    """
+    if rate == 1.0 or len(audio) < 1024:
+        return audio
+
+    # Parameters tuned for speech
+    window_size = int(sample_rate * 0.05)       # 50ms windows — matches typical speech patterns
+    window_size += window_size % 2              # Make even for clean math
+    seek_size = int(sample_rate * 0.015)        # Search ±15ms for best splice point
+
+    hop_out = window_size // 2                  # Output spacing (synthesis hop)
+    hop_in = int(hop_out * rate)                # Input spacing (analysis hop)
+
+    # Hann window for smooth crossfading between overlapping segments
+    hann = np.hanning(window_size).astype(np.float32)
+
+    output_len = int(len(audio) / rate) + window_size
+    output = np.zeros(output_len, dtype=np.float32)
+    norm = np.zeros(output_len, dtype=np.float32)
+
+    in_pos = 0
+    out_pos = 0
+
+    while in_pos + window_size < len(audio) and out_pos + window_size < output_len:
+        best_pos = in_pos
+
+        # For frames after the first, search for the best overlap point
+        if out_pos > 0:
+            search_start = max(0, in_pos - seek_size)
+            search_end = min(len(audio) - window_size, in_pos + seek_size)
+
+            if search_end > search_start:
+                # Compare candidates against what's already in the output
+                ref = output[out_pos:out_pos + window_size]
+                search_audio = audio[search_start:search_end + window_size]
+
+                # Cross-correlation finds where the waveforms line up best
+                if len(search_audio) >= len(ref):
+                    corr = np.correlate(search_audio, ref, mode='valid')
+                    best_pos = search_start + np.argmax(corr)
+
+        # Overlap-add this window into the output
+        frame = audio[best_pos:best_pos + window_size] * hann
+        output[out_pos:out_pos + window_size] += frame
+        norm[out_pos:out_pos + window_size] += hann
+
+        # Advance by the fixed stride, NOT from best_pos.
+        # If we used "in_pos = best_pos + hop_in", the search adjustment
+        # would accumulate over many iterations, causing us to race through
+        # the input too fast and miss the end.
+        in_pos += hop_in
+        out_pos += hop_out
+
+    # Append any remaining audio that the loop didn't process
+    # (the loop stops when there isn't a full window left, so the tail gets lost)
+    remaining = audio[in_pos:]
+    if len(remaining) > 0 and out_pos < output_len:
+        copy_len = min(len(remaining), output_len - out_pos)
+        output[out_pos:out_pos + copy_len] += remaining[:copy_len]
+        norm[out_pos:out_pos + copy_len] += 1.0
+
+    # Normalize to prevent amplitude changes from the overlap-add
+    mask = norm > 1e-8
+    output[mask] /= norm[mask]
+
+    # Trim to the last sample that actually has audio content
+    # (rather than guessing the length, just find where we actually wrote audio)
+    nonzero = np.flatnonzero(norm > 1e-8)
+    if len(nonzero) > 0:
+        return output[:nonzero[-1] + 1]
+    return output[:0]
+
+
+# ---------------------------------------------------------------------------
 # Audio chunk generators (one per engine, same output format)
 # ---------------------------------------------------------------------------
 def generate_audio_chunks(text):
-    """Yield float32 numpy arrays of audio, one chunk at a time."""
+    """Yield float32 numpy arrays of audio, one chunk at a time.
+
+    Audio is generated at normal speed (1.0x), then time-stretched to
+    the user's chosen speed using WSOLA. This preserves all syllables,
+    keeps the original pitch, and maintains natural voice quality.
+    """
+    sample_rate = get_sample_rate()
+
     if TTS_ENGINE == "kokoro":
-        for gs, ps, audio in tts_engine_obj(text, voice=KOKORO_VOICE, speed=KOKORO_SPEED):
-            # Kokoro returns a torch tensor — convert to numpy for sounddevice
+        for gs, ps, audio in tts_engine_obj(text, voice=KOKORO_VOICE, speed=1.0):
             if hasattr(audio, "numpy"):
                 audio = audio.numpy()
+            if current_speed != 1.0:
+                audio = time_stretch_wsola(audio, current_speed, sample_rate)
             yield audio
     elif TTS_ENGINE == "piper":
         for audio_bytes in tts_engine_obj.synthesize_stream_raw(text):
             int_data = np.frombuffer(audio_bytes, dtype=np.int16)
-            yield int_data.astype(np.float32) / 32768.0
+            audio = int_data.astype(np.float32) / 32768.0
+            if current_speed != 1.0:
+                audio = time_stretch_wsola(audio, current_speed, sample_rate)
+            yield audio
 
 
 def get_sample_rate():
@@ -331,6 +494,13 @@ def play_audio_stream(chunks_generator, sample_rate):
                 end = offset + PLAYBACK_CHUNK_SAMPLES
                 stream.write(chunk[offset:end])
                 offset = end
+
+        # Write a short block of silence to flush the audio buffer.
+        # Without this, stream.stop() cuts off audio still in the buffer,
+        # clipping the last words.
+        silence = np.zeros(PLAYBACK_CHUNK_SAMPLES, dtype=np.float32)
+        stream.write(silence)
+
     except StopSpeaking:
         raise
     finally:
@@ -445,7 +615,7 @@ def on_read_selected():
             play_error_sound()
             return
 
-        text = text.strip()
+        text = clean_text_for_speech(text)
         log(f"Got text ({len(text)} chars)")
 
         # Speak it in a background thread
@@ -476,12 +646,48 @@ def on_ocr_region():
         traceback.print_exc()
 
 
+_overlay_root = None  # Module-level reference prevents premature garbage collection
+
 def open_region_selector():
     """Open a fullscreen overlay where the user drags a rectangle to capture."""
+    global _overlay_root
     play_ocr_ready_sound()
 
+    # If a previous overlay root exists, destroy it now (on the main thread)
+    if _overlay_root is not None:
+        try:
+            _overlay_root.destroy()
+        except Exception:
+            pass
+
     root = tk.Tk()
-    root.attributes("-fullscreen", True)
+    _overlay_root = root  # Keep a reference so GC doesn't clean it up on a random thread
+
+    # Span ALL monitors, not just the primary one.
+    # "-fullscreen" only covers the primary monitor in tkinter.
+    # Instead, we manually size the window to cover the entire virtual screen
+    # (the bounding box of all monitors combined).
+    screen_left = root.winfo_vrootx()
+    screen_top = root.winfo_vrooty()
+
+    # Use pyautogui to get the full virtual screen size (all monitors)
+    total_width, total_height = pyautogui.size()
+
+    # On multi-monitor setups, the virtual screen can start at negative coordinates
+    # (if a monitor is to the left of the primary). We need the actual bounds.
+    try:
+        user32 = ctypes.windll.user32
+        # SM_XVIRTUALSCREEN (76) = left edge, SM_YVIRTUALSCREEN (77) = top edge
+        # SM_CXVIRTUALSCREEN (78) = total width, SM_CYVIRTUALSCREEN (79) = total height
+        screen_left = user32.GetSystemMetrics(76)
+        screen_top = user32.GetSystemMetrics(77)
+        total_width = user32.GetSystemMetrics(78)
+        total_height = user32.GetSystemMetrics(79)
+    except Exception:
+        pass  # Fall back to pyautogui.size() if this fails
+
+    root.overrideredirect(True)  # Remove window borders/title bar
+    root.geometry(f"{total_width}x{total_height}+{screen_left}+{screen_top}")
     root.attributes("-topmost", True)
     root.attributes("-alpha", 0.3)          # 30% opacity — screen looks dimmed
     root.configure(cursor="crosshair")
@@ -491,6 +697,26 @@ def open_region_selector():
 
     # State for drag tracking
     drag_state = {"start_x": None, "start_y": None, "rect_id": None}
+    overlay_closed = False  # Prevents double-closing from multiple handlers
+    esc_hook = [None]       # Holds the keyboard hook reference (list so closures can modify it)
+
+    def close_overlay():
+        """Safely close the overlay (only runs once, always on tkinter's thread).
+
+        We hide the window and tell mainloop to stop, but we do NOT destroy
+        the window here. Destruction happens after mainloop exits, on the
+        main thread, to avoid 'Tcl_AsyncDelete: async handler deleted by
+        the wrong thread' errors.
+        """
+        nonlocal overlay_closed
+        if overlay_closed:
+            return
+        overlay_closed = True
+        if esc_hook[0] is not None:
+            keyboard.unhook(esc_hook[0])
+            esc_hook[0] = None
+        root.withdraw()  # Hide the window immediately (so it's not in screenshots)
+        root.quit()      # Tell mainloop to stop (actual destroy happens after mainloop exits)
 
     def on_mouse_down(event):
         drag_state["start_x"] = event.x
@@ -506,17 +732,23 @@ def open_region_selector():
         )
 
     def on_mouse_up(event):
-        # Calculate the rectangle coordinates
+        # Calculate the rectangle coordinates (relative to the overlay window)
         x1 = min(drag_state["start_x"], event.x)
         y1 = min(drag_state["start_y"], event.y)
         x2 = max(drag_state["start_x"], event.x)
         y2 = max(drag_state["start_y"], event.y)
 
+        # Convert to absolute screen coordinates (needed for pyautogui screenshot)
+        abs_x1 = x1 + screen_left
+        abs_y1 = y1 + screen_top
+        abs_x2 = x2 + screen_left
+        abs_y2 = y2 + screen_top
+
         # Close the overlay first (so it's not in the screenshot)
-        root.destroy()
+        close_overlay()
 
         # Skip if the rectangle is too small (accidental click)
-        if (x2 - x1) < 10 or (y2 - y1) < 10:
+        if (abs_x2 - abs_x1) < 10 or (abs_y2 - abs_y1) < 10:
             log("Selection too small, cancelled.")
             play_error_sound()
             return
@@ -525,21 +757,42 @@ def open_region_selector():
         time.sleep(0.2)
 
         # Take a screenshot of just that region
-        screenshot = pyautogui.screenshot(region=(x1, y1, x2 - x1, y2 - y1))
+        screenshot = pyautogui.screenshot(region=(abs_x1, abs_y1, abs_x2 - abs_x1, abs_y2 - abs_y1))
 
         # OCR and speak in a background thread
         threading.Thread(target=ocr_and_speak, args=(screenshot,), daemon=True).start()
 
     def on_escape(event):
-        root.destroy()
+        close_overlay()
         log("OCR capture cancelled.")
+
+    def on_overlay_escape(event):
+        # The keyboard library calls this from a background thread.
+        # Tkinter isn't safe to call from other threads, so we use
+        # root.after() to schedule the close on tkinter's own thread.
+        try:
+            root.after(0, close_overlay)
+        except Exception:
+            pass
 
     canvas.bind("<ButtonPress-1>", on_mouse_down)
     canvas.bind("<B1-Motion>", on_mouse_drag)
     canvas.bind("<ButtonRelease-1>", on_mouse_up)
     root.bind("<Escape>", on_escape)
+    # Also register with keyboard library as a backup — fires even without focus
+    esc_hook[0] = keyboard.on_press_key("esc", on_overlay_escape)
 
     root.mainloop()
+
+    # Clean up the keyboard hook if it wasn't already removed by close_overlay
+    if esc_hook[0] is not None:
+        keyboard.unhook(esc_hook[0])
+        esc_hook[0] = None
+
+    # Do NOT destroy root here. The _overlay_root reference keeps it alive,
+    # preventing garbage collection on a random thread (which causes
+    # "Tcl_AsyncDelete: async handler deleted by the wrong thread").
+    # It gets destroyed on the main thread at the start of the NEXT OCR capture.
 
 
 def ocr_and_speak(screenshot_image):
@@ -562,6 +815,7 @@ def ocr_and_speak(screenshot_image):
             update_tray_icon("ready")
             return
 
+        text = clean_text_for_speech(text)
         log(f'OCR result: "{text[:80]}{"..." if len(text) > 80 else ""}"')
         speak_text(text)
 
@@ -583,6 +837,34 @@ def on_stop(event):
         is_speaking = False
         play_stop_sound()
         log("Speech stopped by user.")
+
+
+# ---------------------------------------------------------------------------
+# Speed control
+# ---------------------------------------------------------------------------
+SPEED_MIN = 0.5    # Slowest allowed speed
+SPEED_MAX = 3.0    # Fastest allowed speed
+SPEED_STEP = 0.25  # How much each press changes the speed
+
+def on_speed_up():
+    """Hotkey handler: increase speech speed."""
+    global current_speed
+    if current_speed < SPEED_MAX:
+        current_speed = round(current_speed + SPEED_STEP, 2)
+        log(f"Speed: {current_speed}x")
+        winsound.Beep(1000 + int(current_speed * 200), 50)  # Higher pitch = faster
+    else:
+        log(f"Speed: {current_speed}x (already at maximum)")
+
+def on_speed_down():
+    """Hotkey handler: decrease speech speed."""
+    global current_speed
+    if current_speed > SPEED_MIN:
+        current_speed = round(current_speed - SPEED_STEP, 2)
+        log(f"Speed: {current_speed}x")
+        winsound.Beep(1000 + int(current_speed * 200), 50)  # Lower pitch = slower
+    else:
+        log(f"Speed: {current_speed}x (already at minimum)")
 
 
 # ---------------------------------------------------------------------------
@@ -608,23 +890,23 @@ def main():
         log("Running without tray icon.")
 
     # Print controls
-    print(f"  Press  Ctrl+Alt+R  to read selected text aloud")
-    print(f"  Press  Ctrl+Alt+O  to OCR a screen region")
-    print(f"  Press  Escape      to stop speaking")
+    print(f"  Press  Ctrl+Alt+R         to read selected text aloud")
+    print(f"  Press  Ctrl+Alt+O         to OCR a screen region")
+    print(f"  Press  Ctrl+Alt+Right     to speed up")
+    print(f"  Press  Ctrl+Alt+Left      to slow down")
+    print(f"  Press  Escape             to stop speaking")
     print(f"  Right-click tray icon to quit")
     print()
-    log(f"Ready! Engine: {TTS_ENGINE}")
+    log(f"Ready! Engine: {TTS_ENGINE}, Speed: {current_speed}x")
     print()
 
     # Register hotkeys
-    # trigger_on_release=True means the callback fires when the last key in
-    # the combo is released, not pressed. This is more reliable for multi-key
-    # combos because it avoids issues where the callback fires while modifier
-    # keys are still held down (which can interfere with the Ctrl+C simulation).
     keyboard.add_hotkey(HOTKEY_READ, on_read_selected, suppress=False)
     keyboard.add_hotkey(HOTKEY_OCR, on_ocr_region, suppress=False)
+    keyboard.add_hotkey(HOTKEY_SPEED_UP, on_speed_up, suppress=False)
+    keyboard.add_hotkey(HOTKEY_SPEED_DOWN, on_speed_down, suppress=False)
     keyboard.on_press_key("esc", on_stop)
-    log(f"Hotkeys registered: {HOTKEY_READ}, {HOTKEY_OCR}, Escape")
+    log(f"Hotkeys registered: {HOTKEY_READ}, {HOTKEY_OCR}, {HOTKEY_SPEED_UP}, {HOTKEY_SPEED_DOWN}, Escape")
 
     # Main loop
     try:

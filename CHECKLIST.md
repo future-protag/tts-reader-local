@@ -48,6 +48,12 @@ or draw a box on screen to OCR and read non-selectable text.
 
 ---
 
+## Known Bugs
+
+- [x] **OCR doesn't work on secondary monitor** — `pyautogui.screenshot()` only captures the primary monitor (known upstream limitation). Fix: replaced with `mss` library which uses Windows GDI directly and works on all monitors. Also upgraded DPI awareness to per-monitor v2. Needs testing with a second screen connected.
+
+---
+
 ## Status: Ready for live testing
 
 All code is written and dependencies are installed. Kokoro engine loads
@@ -65,12 +71,12 @@ as Administrator.
 ### Desktop (Kokoro — needs GPU)
 1. Install Python 3.12: `py install 3.12`
 2. `py -3.12 -m pip install torch --index-url https://download.pytorch.org/whl/cu128`
-3. `py -3.12 -m pip install kokoro>=0.9.4 soundfile sounddevice numpy keyboard pyperclip pyautogui pystray Pillow winocr`
+3. `py -3.12 -m pip install kokoro>=0.9.4 soundfile sounddevice numpy keyboard pyperclip pyautogui mss pystray Pillow winocr`
 4. espeak-ng is bundled with kokoro's `espeakng-loader` package (no separate install needed)
 
 ### Laptop (Piper — CPU only)
 1. Install Python 3.12: `py install 3.12`
-2. `py -3.12 -m pip install piper-tts sounddevice numpy keyboard pyperclip pyautogui pystray Pillow winocr`
+2. `py -3.12 -m pip install piper-tts sounddevice numpy keyboard pyperclip pyautogui mss pystray Pillow winocr`
 3. Change `TTS_ENGINE = "piper"` at top of `tts_reader.py`
 4. Voice model auto-downloads on first run
 

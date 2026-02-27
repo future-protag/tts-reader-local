@@ -28,10 +28,28 @@ import tkinter as tk
 # Tell Windows we handle DPI ourselves — give us real pixel coordinates.
 # Without this, multi-monitor setups with different scaling factors report
 # wrong coordinates, causing screenshots to capture the wrong area.
+#
+# There are three levels of DPI awareness on Windows:
+#   1. SetProcessDPIAware() — only knows the PRIMARY monitor's scaling.
+#      Secondary monitors with different scaling get wrong coordinates.
+#   2. SetProcessDpiAwareness(2) — per-monitor aware (Windows 8.1+).
+#   3. SetProcessDpiAwarenessContext(-4) — per-monitor aware v2 (Windows 10 1703+).
+#      This is the best option: gives correct physical pixel coordinates on ALL monitors.
+#
+# We try the best one first and fall back to weaker options on older Windows.
+# IMPORTANT: This must happen before importing mss or pyautogui, because
+# Windows only allows setting DPI awareness ONCE per process — whichever
+# library sets it first wins, and the others can't change it.
 try:
-    ctypes.windll.user32.SetProcessDPIAware()
-except Exception:
-    pass
+    ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+except (AttributeError, OSError):
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except (AttributeError, OSError):
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except (AttributeError, OSError):
+            pass
 
 # Suppress noisy warnings from libraries before importing them
 warnings.filterwarnings("ignore", category=UserWarning, module="torch")
@@ -43,11 +61,13 @@ import numpy as np
 import sounddevice as sd
 import keyboard
 import pyperclip
+import mss              # Multi-monitor screenshot library — must be imported BEFORE pyautogui
 import pyautogui
+from PIL import Image   # Used to convert mss screenshots to PIL format for OCR
 
 # Try to import system tray libraries (optional — script works without them)
 try:
-    from PIL import Image, ImageDraw
+    from PIL import ImageDraw
     import pystray
     TRAY_AVAILABLE = True
 except ImportError:
@@ -756,8 +776,18 @@ def open_region_selector():
         # Small delay so the overlay fully disappears before screenshot
         time.sleep(0.2)
 
-        # Take a screenshot of just that region
-        screenshot = pyautogui.screenshot(region=(abs_x1, abs_y1, abs_x2 - abs_x1, abs_y2 - abs_y1))
+        # Take a screenshot of just that region.
+        # We use mss instead of pyautogui.screenshot() because pyautogui only
+        # captures the primary monitor. mss uses the Windows GDI API directly
+        # and works on all monitors, including ones with negative coordinates
+        # (e.g. a monitor positioned to the left of the primary).
+        width = abs_x2 - abs_x1
+        height = abs_y2 - abs_y1
+        with mss.mss() as sct:
+            region = {"left": abs_x1, "top": abs_y1, "width": width, "height": height}
+            raw = sct.grab(region)
+            # Convert from mss's BGRA format to a PIL RGB Image (which winocr expects)
+            screenshot = Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
 
         # OCR and speak in a background thread
         threading.Thread(target=ocr_and_speak, args=(screenshot,), daemon=True).start()

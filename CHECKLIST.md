@@ -21,13 +21,13 @@ or draw a box on screen to OCR and read non-selectable text.
 - [x] Implement Ctrl+Alt+R: grab selected text via clipboard
 - [x] Implement streaming audio playback via sounddevice
 - [x] Implement Escape to stop speaking mid-sentence
-- [ ] Test: select text in Notepad, press Ctrl+Alt+R, hear it spoken (needs live test)
+- [x] Test: select text in Notepad, press Ctrl+Alt+R, hear it spoken
 
 ## Phase 2: System Tray + Launcher
 - [x] Add system tray icon (green=ready, blue=speaking, yellow=processing)
 - [x] Add tray menu (quit)
 - [x] Create `run_tts_reader.bat` (Admin elevation, uses `py -3.12`)
-- [ ] Test: launch via batch file, verify tray icon works (needs live test)
+- [x] Test: launch via batch file, verify tray icon works
 
 ## Phase 3: OCR Mode (Screen Region)
 - [x] Implement tkinter fullscreen overlay (dimmed, crosshair cursor)
@@ -35,7 +35,7 @@ or draw a box on screen to OCR and read non-selectable text.
 - [x] Implement screenshot capture of selected region
 - [x] Implement OCR via winocr (Windows built-in OCR)
 - [x] Wire up: Ctrl+Alt+O → overlay → drag → screenshot → OCR → speak
-- [ ] Test: OCR text from an image or document (needs live test)
+- [x] Test: OCR text from an image or document
 
 ## Phase 4: Piper Engine (Laptop Support)
 - [x] Add Piper TTS engine wrapper (same interface as Kokoro)
@@ -50,7 +50,7 @@ or draw a box on screen to OCR and read non-selectable text.
 
 ## Known Bugs
 
-- [x] **OCR doesn't work on secondary monitor** — `pyautogui.screenshot()` only captures the primary monitor (known upstream limitation). Fix: replaced with `mss` library which uses Windows GDI directly and works on all monitors. Also upgraded DPI awareness to per-monitor v2. Needs testing with a second screen connected.
+- [x] **OCR doesn't work on secondary monitor** — `pyautogui.screenshot()` only captures the primary monitor (known upstream limitation). Fix: replaced with `mss` library which uses Windows GDI directly and works on all monitors. Also upgraded DPI awareness to per-monitor v2. Tested and working.
 
 ---
 

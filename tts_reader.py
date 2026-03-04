@@ -100,6 +100,49 @@ PIPER_DOWNLOAD_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0
 # --- OCR settings ---
 OCR_LANGUAGE = "en"            # Language for Windows OCR
 
+# --- Available Kokoro voices (grouped by accent and gender) ---
+# Each key is a submenu label, each value is a list of (display_name, voice_id) pairs.
+# The accent letter ("a" or "b") is used to determine if the Kokoro pipeline
+# needs to be reloaded when switching between American and British voices.
+KOKORO_VOICES = {
+    "American Female": [
+        ("Alloy",   "af_alloy"),
+        ("Aoede",   "af_aoede"),
+        ("Bella",   "af_bella"),
+        ("Heart",   "af_heart"),
+        ("Jessica", "af_jessica"),
+        ("Kore",    "af_kore"),
+        ("Nicole",  "af_nicole"),
+        ("Nova",    "af_nova"),
+        ("River",   "af_river"),
+        ("Sarah",   "af_sarah"),
+        ("Sky",     "af_sky"),
+    ],
+    "American Male": [
+        ("Adam",    "am_adam"),
+        ("Echo",    "am_echo"),
+        ("Eric",    "am_eric"),
+        ("Fenrir",  "am_fenrir"),
+        ("Liam",    "am_liam"),
+        ("Michael", "am_michael"),
+        ("Onyx",    "am_onyx"),
+        ("Puck",    "am_puck"),
+        ("Santa",   "am_santa"),
+    ],
+    "British Female": [
+        ("Alice",    "bf_alice"),
+        ("Emma",     "bf_emma"),
+        ("Isabella", "bf_isabella"),
+        ("Lily",     "bf_lily"),
+    ],
+    "British Male": [
+        ("Daniel", "bm_daniel"),
+        ("Fable",  "bm_fable"),
+        ("George", "bm_george"),
+        ("Lewis",  "bm_lewis"),
+    ],
+}
+
 
 # ---------------------------------------------------------------------------
 # Global state
@@ -111,6 +154,8 @@ tray_icon = None               # System tray icon
 should_quit = False            # Signal to exit the program
 ocr_requested = False          # Flag: main loop should open the region selector
 current_speed = KOKORO_SPEED   # Current speech speed (can be changed with hotkeys)
+current_voice = KOKORO_VOICE   # Current Kokoro voice (can be changed from tray menu)
+current_lang = KOKORO_LANG     # Current Kokoro accent/language code
 
 
 # ---------------------------------------------------------------------------
@@ -214,13 +259,83 @@ def quit_from_tray():
     if tray_icon is not None:
         tray_icon.stop()
 
+def change_voice(voice_id):
+    """Switch to a different Kokoro voice. Reloads the pipeline if the accent changed."""
+    global current_voice, current_lang, tts_engine_obj
+
+    if voice_id == current_voice:
+        return  # Already using this voice
+
+    old_lang = current_lang
+    new_lang = voice_id[0]  # First character is the accent letter ("a" or "b")
+
+    current_voice = voice_id
+    current_lang = new_lang
+    log(f"Voice changed to: {voice_id}")
+
+    # If the accent changed (e.g. American → British), we need to reload the
+    # Kokoro pipeline because the accent is set when the pipeline is created.
+    # Voice-only changes (same accent) take effect immediately — the voice is
+    # passed each time we generate audio, so no reload needed.
+    if new_lang != old_lang:
+        log(f"Accent changed ({old_lang} → {new_lang}), reloading Kokoro pipeline...")
+        def reload_pipeline():
+            global tts_engine_obj
+            try:
+                from kokoro import KPipeline
+                tts_engine_obj = KPipeline(lang_code=new_lang, repo_id="hexgrad/Kokoro-82M")
+                log(f"Pipeline reloaded for accent '{new_lang}'.")
+            except Exception as e:
+                log(f"Failed to reload pipeline: {e}")
+        threading.Thread(target=reload_pipeline, daemon=True).start()
+
+    # Rebuild the tray menu so the checkmark moves to the new voice
+    if tray_icon is not None:
+        tray_icon.menu = build_tray_menu()
+
+
 def build_tray_menu():
     """Build the right-click menu for the tray icon."""
-    return pystray.Menu(
+    menu_items = [
         pystray.MenuItem("TTS Reader", None, enabled=False),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem("Quit", lambda: quit_from_tray()),
-    )
+    ]
+
+    # Add voice submenu only for Kokoro engine
+    if TTS_ENGINE == "kokoro":
+        # Build a submenu for each accent/gender group
+        voice_submenus = []
+        for group_name, voices in KOKORO_VOICES.items():
+            voice_items = []
+            for display_name, voice_id in voices:
+                # Use a factory function to capture voice_id correctly in the closure.
+                # Without this, all menu items would use the LAST voice_id from the loop
+                # (a common Python gotcha with closures in loops).
+                def make_action(vid):
+                    return lambda: change_voice(vid)
+                def make_checked(vid):
+                    return lambda item: current_voice == vid
+
+                voice_items.append(
+                    pystray.MenuItem(
+                        display_name,
+                        make_action(voice_id),
+                        checked=make_checked(voice_id),
+                        radio=True,
+                    )
+                )
+            voice_submenus.append(
+                pystray.MenuItem(group_name, pystray.Menu(*voice_items))
+            )
+
+        menu_items.append(
+            pystray.MenuItem("Voice", pystray.Menu(*voice_submenus))
+        )
+        menu_items.append(pystray.Menu.SEPARATOR)
+
+    menu_items.append(pystray.MenuItem("Quit", lambda: quit_from_tray()))
+
+    return pystray.Menu(*menu_items)
 
 def start_tray_icon():
     """Start the system tray icon in a background thread."""
@@ -246,8 +361,8 @@ def load_tts_engine():
         log("Loading Kokoro TTS engine...")
         try:
             from kokoro import KPipeline
-            tts_engine_obj = KPipeline(lang_code=KOKORO_LANG, repo_id="hexgrad/Kokoro-82M")
-            log(f"Kokoro loaded! Voice: {KOKORO_VOICE}")
+            tts_engine_obj = KPipeline(lang_code=current_lang, repo_id="hexgrad/Kokoro-82M")
+            log(f"Kokoro loaded! Voice: {current_voice}")
         except Exception as e:
             log(f"Failed to load Kokoro: {e}")
             log("Make sure kokoro and espeak-ng are installed (see README).")
@@ -457,7 +572,7 @@ def generate_audio_chunks(text):
     sample_rate = get_sample_rate()
 
     if TTS_ENGINE == "kokoro":
-        for gs, ps, audio in tts_engine_obj(text, voice=KOKORO_VOICE, speed=1.0):
+        for gs, ps, audio in tts_engine_obj(text, voice=current_voice, speed=1.0):
             if hasattr(audio, "numpy"):
                 audio = audio.numpy()
             if current_speed != 1.0:

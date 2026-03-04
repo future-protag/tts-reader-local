@@ -1,0 +1,6 @@
+Fix:
+- Test the second screen fix (human in the loop might not be needed for this)
+
+Add functionality:
+- [done] Pick voice — added Voice submenu to tray icon (right-click menu)
+- [done] Pick accent — voice menu is grouped by accent, switching accent reloads the engine

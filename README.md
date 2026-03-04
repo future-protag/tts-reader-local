@@ -36,7 +36,7 @@ py -3.12 -m pip install torch --index-url https://download.pytorch.org/whl/cu128
 ### 3. Install the other packages
 
 ```
-py -3.12 -m pip install kokoro>=0.9.4 soundfile sounddevice numpy keyboard pyperclip pyautogui pystray Pillow winocr
+py -3.12 -m pip install kokoro>=0.9.4 soundfile sounddevice numpy keyboard pyperclip pyautogui mss pystray Pillow winocr
 ```
 
 ### 4. Run it
@@ -63,7 +63,7 @@ py install 3.12
 ### 2. Install packages
 
 ```
-py -3.12 -m pip install piper-tts sounddevice numpy keyboard pyperclip pyautogui pystray Pillow winocr
+py -3.12 -m pip install piper-tts sounddevice numpy keyboard pyperclip pyautogui mss pystray Pillow winocr
 ```
 
 ### 3. Edit the config

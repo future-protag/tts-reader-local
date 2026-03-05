@@ -18,6 +18,7 @@ Controls:
 import os
 import sys
 import json
+import queue
 import time
 import logging
 import warnings
@@ -344,18 +345,53 @@ PLAYBACK_CHUNK_SAMPLES = 7200
 
 
 def play_audio_stream(chunks_generator, sample_rate):
-    """Play audio chunks through the speakers as they arrive from the TTS engine."""
+    """Play audio chunks through the speakers as they arrive from the TTS engine.
+
+    Uses a background thread to generate the next chunk while the current one
+    is playing, so there's no gap between sentences.
+    """
     global is_speaking
     is_speaking = True
+
+    # The queue lets the TTS engine work ahead — while one sentence is playing
+    # through the speakers, the next sentence is already being generated.
+    # maxsize=5 means up to 5 sentences can be pre-generated and waiting.
+    # Memory cost is tiny (~2 MB max), and the extra buffer covers short
+    # sentences or bullet points where playback outpaces generation.
+    audio_queue = queue.Queue(maxsize=5)
+    sentinel = object()  # Special marker meaning "no more audio"
+
+    def producer():
+        """Generate audio chunks in a background thread."""
+        try:
+            for chunk in chunks_generator:
+                if not is_speaking:
+                    return
+                audio_queue.put(chunk)
+        except Exception:
+            pass
+        finally:
+            audio_queue.put(sentinel)
+
+    threading.Thread(target=producer, daemon=True).start()
 
     stream = sd.OutputStream(samplerate=sample_rate, channels=1, dtype="float32")
     stream.start()
 
     try:
-        for chunk in chunks_generator:
+        while True:
+            # Get the next chunk. Timeout lets us check for Escape while waiting.
+            try:
+                chunk = audio_queue.get(timeout=0.1)
+            except queue.Empty:
+                if not is_speaking:
+                    raise StopSpeaking()
+                continue
+
+            if chunk is sentinel:
+                break
+
             # Break each TTS chunk into small pieces so Escape is responsive.
-            # Kokoro can return 5+ seconds of audio in a single chunk — without
-            # splitting, stream.write() blocks for that entire duration.
             offset = 0
             while offset < len(chunk):
                 if not is_speaking:

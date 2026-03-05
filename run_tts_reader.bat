@@ -7,6 +7,6 @@ if %errorlevel% neq 0 (
     exit /b
 )
 
-cd /d "d:\Agent work\tts-reader"
+cd /d "%~dp0"
 py -3.12 tts_reader.py
 pause

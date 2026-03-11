@@ -107,7 +107,7 @@ Per-PC settings are stored in `config.json` (in the same folder as the script). 
 
 You only need to include settings you want to change — any missing settings use their defaults.
 
-Your voice and speed choices are also saved automatically to `preferences.json` when you change them via the tray menu or speed hotkeys.
+Your voice and speed choices are saved back to `config.json` automatically when you change them via the tray menu or speed hotkeys.
 
 ### Kokoro voice names
 

@@ -1,9 +1,6 @@
 # Per-PC settings (each computer keeps its own config)
 config.json
 
-# Runtime preferences (voice/speed choices saved automatically)
-preferences.json
-
 # Voice model files (too large for git — auto-downloaded at runtime)
 voices/*.onnx
 voices/*.onnx.json

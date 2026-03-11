@@ -136,9 +136,6 @@ OCR_LANGUAGE = "en"            # Language for Windows OCR
 # Error log file — records crashes and errors for debugging
 ERROR_LOG = os.path.join(SCRIPT_DIR, "error_log.txt")
 
-# Preferences file — remembers your voice and speed between sessions
-PREFS_FILE = os.path.join(SCRIPT_DIR, "preferences.json")
-
 # --- Available Kokoro voices (grouped by accent and gender) ---
 # Each key is a submenu label, each value is a list of (display_name, voice_id) pairs.
 # The accent letter ("a" or "b") is used to determine if the Kokoro pipeline
@@ -216,31 +213,26 @@ def write_error_log(error):
 
 
 def save_preferences():
-    """Save current voice and speed to preferences.json."""
-    import json
-    prefs = {"voice": current_voice, "speed": current_speed}
-    with open(PREFS_FILE, "w", encoding="utf-8") as f:
-        json.dump(prefs, f)
+    """Save current voice and speed back into config.json."""
+    try:
+        with open(CONFIG_PATH, "r") as f:
+            config = json.load(f)
+        config["kokoro_voice"] = current_voice
+        config["kokoro_speed"] = current_speed
+        with open(CONFIG_PATH, "w") as f:
+            json.dump(config, f, indent=4)
+    except Exception:
+        pass  # If config.json is somehow missing or broken, don't crash
 
 
 def load_preferences():
-    """Load voice and speed from preferences.json (if it exists)."""
-    import json
+    """Load voice and speed from config.json (already loaded at startup, but
+    this updates the runtime globals in case they differ from the module-level constants)."""
     global current_voice, current_lang, current_speed
-    if not os.path.exists(PREFS_FILE):
-        return
-    try:
-        with open(PREFS_FILE, "r", encoding="utf-8") as f:
-            prefs = json.load(f)
-        if "voice" in prefs:
-            current_voice = prefs["voice"]
-            current_lang = prefs["voice"][0]  # First character is accent letter
-            log(f"Loaded saved voice: {current_voice}")
-        if "speed" in prefs:
-            current_speed = prefs["speed"]
-            log(f"Loaded saved speed: {current_speed}x")
-    except Exception:
-        pass  # If the file is corrupted, just use defaults
+    current_voice = KOKORO_VOICE
+    current_lang = KOKORO_VOICE[0]  # First character is accent letter ("a" or "b")
+    current_speed = KOKORO_SPEED
+    log(f"Voice: {current_voice}, Speed: {current_speed}x")
 
 
 # ---------------------------------------------------------------------------

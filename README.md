@@ -13,8 +13,10 @@ Runs 100% offline. Uses **Kokoro** (high-quality, GPU) on desktop or **Piper** (
 |-----|-------------|
 | `Ctrl+Alt+R` | Read selected text aloud |
 | `Ctrl+Alt+O` | OCR a screen region, then read aloud |
+| `Ctrl+Alt+Right` | Speed up |
+| `Ctrl+Alt+Left` | Slow down |
 | `Escape` | Stop speaking |
-| Tray icon | Right-click to quit |
+| Tray icon | Right-click for voice picker and quit |
 
 ## Setup — Desktop (GPU)
 
@@ -68,9 +70,11 @@ py -3.12 -m pip install piper-tts sounddevice numpy keyboard pyperclip pyautogui
 
 ### 3. Edit the config
 
-Open `tts_reader.py` and change this line near the top:
-```python
-TTS_ENGINE = "piper"
+Open `config.json` (created automatically on first run) and change `tts_engine` to `"piper"`:
+```json
+{
+    "tts_engine": "piper"
+}
 ```
 
 ### 4. Run it
@@ -83,14 +87,27 @@ The first run downloads the Piper voice model (~60 MB) automatically.
 
 ## Configuration
 
-All settings are at the top of `tts_reader.py`:
+Per-PC settings are stored in `config.json` (in the same folder as the script). This file is created automatically on first run with default values. It is not tracked by git, so each PC keeps its own copy.
 
-```python
-TTS_ENGINE = "kokoro"          # "kokoro" (desktop) or "piper" (laptop)
-KOKORO_VOICE = "af_heart"      # Kokoro voice name (see voice list below)
-KOKORO_SPEED = 1.0             # Speech speed (1.0 = normal)
-PIPER_MODEL = "voices/en_US-lessac-medium.onnx"  # Piper voice file
+```json
+{
+    "tts_engine": "kokoro",
+    "kokoro_voice": "af_heart",
+    "kokoro_speed": 1.0,
+    "piper_model": "voices/en_US-lessac-high.onnx"
+}
 ```
+
+| Setting | What it does | Options |
+|---------|-------------|---------|
+| `tts_engine` | Which TTS engine to use | `"kokoro"` (desktop GPU) or `"piper"` (laptop CPU) |
+| `kokoro_voice` | Kokoro voice name | See voice list below |
+| `kokoro_speed` | Speech speed for Kokoro | `1.0` = normal, `1.5` = faster |
+| `piper_model` | Path to Piper voice file | Default: `voices/en_US-lessac-high.onnx` |
+
+You only need to include settings you want to change — any missing settings use their defaults.
+
+Your voice and speed choices are also saved automatically to `preferences.json` when you change them via the tray menu or speed hotkeys.
 
 ### Kokoro voice names
 

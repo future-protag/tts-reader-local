@@ -17,6 +17,8 @@ Controls:
 
 import os
 import sys
+import json
+import queue
 import time
 import logging
 import warnings
@@ -78,33 +80,64 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-# Which TTS engine to use: "kokoro" (desktop GPU) or "piper" (laptops)
-TTS_ENGINE = "kokoro"
+# Settings that can differ per PC are stored in config.json (not tracked by git).
+# If config.json doesn't exist, a default one is created automatically.
 
-# Hotkeys
+# Where to find config.json — same folder as this script
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
+
+# Default values (used when config.json is missing or incomplete)
+DEFAULTS = {
+    "tts_engine": "kokoro",
+    "kokoro_voice": "af_heart",
+    "kokoro_speed": 1.0,
+    "piper_model": "voices/en_US-lessac-high.onnx",
+}
+
+def load_config():
+    """Load settings from config.json. Creates a default file if it doesn't exist."""
+    if not os.path.exists(CONFIG_PATH):
+        # First run — create a default config.json
+        with open(CONFIG_PATH, "w") as f:
+            json.dump(DEFAULTS, f, indent=4)
+        print(f"Created default config file: {CONFIG_PATH}")
+        print("Edit config.json to change settings (e.g. tts_engine, kokoro_voice).")
+        return dict(DEFAULTS)
+
+    with open(CONFIG_PATH, "r") as f:
+        user_config = json.load(f)
+
+    # Start with defaults, then override with whatever the user put in config.json
+    config = dict(DEFAULTS)
+    config.update(user_config)
+    return config
+
+_config = load_config()
+
+# Per-PC settings (from config.json)
+TTS_ENGINE = _config["tts_engine"]
+KOKORO_VOICE = _config["kokoro_voice"]
+KOKORO_SPEED = _config["kokoro_speed"]
+PIPER_MODEL = _config["piper_model"]
+
+# Hotkeys (same on all PCs)
 HOTKEY_READ = "ctrl+alt+r"          # Read selected text aloud
 HOTKEY_OCR = "ctrl+alt+o"           # OCR a screen region, then read aloud
 HOTKEY_SPEED_UP = "ctrl+alt+right"      # Increase speech speed
 HOTKEY_SPEED_DOWN = "ctrl+alt+left"     # Decrease speech speed
 
-# --- Kokoro settings (only used when TTS_ENGINE = "kokoro") ---
-KOKORO_VOICE = "af_heart"      # Voice name (54 choices, see README)
+# --- Other settings (not in config.json) ---
 KOKORO_LANG = "a"              # "a" = American English, "b" = British English
-KOKORO_SPEED = 1.0             # Speech speed (1.0 = normal, 1.5 = faster)
 KOKORO_SAMPLE_RATE = 24000     # Kokoro outputs audio at 24,000 Hz (don't change)
-
-# --- Piper settings (only used when TTS_ENGINE = "piper") ---
-PIPER_MODEL = "voices/en_US-lessac-medium.onnx"    # Path to the .onnx voice file
-PIPER_DOWNLOAD_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/lessac/medium"
-
-# --- OCR settings ---
+PIPER_DOWNLOAD_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/lessac/high"
 OCR_LANGUAGE = "en"            # Language for Windows OCR
 
 # Error log file — records crashes and errors for debugging
-ERROR_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "error_log.txt")
+ERROR_LOG = os.path.join(SCRIPT_DIR, "error_log.txt")
 
 # Preferences file — remembers your voice and speed between sessions
-PREFS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "preferences.json")
+PREFS_FILE = os.path.join(SCRIPT_DIR, "preferences.json")
 
 # --- Available Kokoro voices (grouped by accent and gender) ---
 # Each key is a submenu label, each value is a list of (display_name, voice_id) pairs.
@@ -623,8 +656,8 @@ def generate_audio_chunks(text):
                 audio = time_stretch_wsola(audio, current_speed, sample_rate)
             yield audio
     elif TTS_ENGINE == "piper":
-        for audio_bytes in tts_engine_obj.synthesize_stream_raw(text):
-            int_data = np.frombuffer(audio_bytes, dtype=np.int16)
+        for chunk in tts_engine_obj.synthesize(text):
+            int_data = np.frombuffer(chunk.audio_int16_bytes, dtype=np.int16)
             audio = int_data.astype(np.float32) / 32768.0
             if current_speed != 1.0:
                 audio = time_stretch_wsola(audio, current_speed, sample_rate)
@@ -654,18 +687,51 @@ PLAYBACK_CHUNK_SAMPLES = 7200
 
 
 def play_audio_stream(chunks_generator, sample_rate):
-    """Play audio chunks through the speakers as they arrive from the TTS engine."""
+    """Play audio chunks through the speakers as they arrive from the TTS engine.
+
+    Uses a background thread to generate the next chunk while the current one
+    is playing, so there's no gap between sentences.
+    """
     global is_speaking
     is_speaking = True
+
+    # The queue lets the TTS engine work ahead — while one sentence is playing
+    # through the speakers, the next sentence is already being generated.
+    # maxsize=5 means up to 5 sentences can be pre-generated and waiting.
+    audio_queue = queue.Queue(maxsize=5)
+    sentinel = object()  # Special marker meaning "no more audio"
+
+    def producer():
+        """Generate audio chunks in a background thread."""
+        try:
+            for chunk in chunks_generator:
+                if not is_speaking:
+                    return
+                audio_queue.put(chunk)
+        except Exception:
+            pass
+        finally:
+            audio_queue.put(sentinel)
+
+    threading.Thread(target=producer, daemon=True).start()
 
     stream = sd.OutputStream(samplerate=sample_rate, channels=1, dtype="float32")
     stream.start()
 
     try:
-        for chunk in chunks_generator:
+        while True:
+            # Get the next chunk. Timeout lets us check for Escape while waiting.
+            try:
+                chunk = audio_queue.get(timeout=0.1)
+            except queue.Empty:
+                if not is_speaking:
+                    raise StopSpeaking()
+                continue
+
+            if chunk is sentinel:
+                break
+
             # Break each TTS chunk into small pieces so Escape is responsive.
-            # Kokoro can return 5+ seconds of audio in a single chunk — without
-            # splitting, stream.write() blocks for that entire duration.
             offset = 0
             while offset < len(chunk):
                 if not is_speaking:

@@ -100,6 +100,12 @@ PIPER_DOWNLOAD_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0
 # --- OCR settings ---
 OCR_LANGUAGE = "en"            # Language for Windows OCR
 
+# Error log file — records crashes and errors for debugging
+ERROR_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "error_log.txt")
+
+# Preferences file — remembers your voice and speed between sessions
+PREFS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "preferences.json")
+
 # --- Available Kokoro voices (grouped by accent and gender) ---
 # Each key is a submenu label, each value is a list of (display_name, voice_id) pairs.
 # The accent letter ("a" or "b") is used to determine if the Kokoro pipeline
@@ -165,6 +171,43 @@ def log(message):
     """Print a timestamped message to the console."""
     timestamp = time.strftime("%H:%M:%S")
     print(f"[{timestamp}] {message}")
+
+
+def write_error_log(error):
+    """Append an error entry to the error log file."""
+    import traceback
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    with open(ERROR_LOG, "a", encoding="utf-8") as f:
+        f.write(f"{timestamp} | {error}\n")
+        f.write(traceback.format_exc() + "\n")
+
+
+def save_preferences():
+    """Save current voice and speed to preferences.json."""
+    import json
+    prefs = {"voice": current_voice, "speed": current_speed}
+    with open(PREFS_FILE, "w", encoding="utf-8") as f:
+        json.dump(prefs, f)
+
+
+def load_preferences():
+    """Load voice and speed from preferences.json (if it exists)."""
+    import json
+    global current_voice, current_lang, current_speed
+    if not os.path.exists(PREFS_FILE):
+        return
+    try:
+        with open(PREFS_FILE, "r", encoding="utf-8") as f:
+            prefs = json.load(f)
+        if "voice" in prefs:
+            current_voice = prefs["voice"]
+            current_lang = prefs["voice"][0]  # First character is accent letter
+            log(f"Loaded saved voice: {current_voice}")
+        if "speed" in prefs:
+            current_speed = prefs["speed"]
+            log(f"Loaded saved speed: {current_speed}x")
+    except Exception:
+        pass  # If the file is corrupted, just use defaults
 
 
 # ---------------------------------------------------------------------------
@@ -272,6 +315,7 @@ def change_voice(voice_id):
     current_voice = voice_id
     current_lang = new_lang
     log(f"Voice changed to: {voice_id}")
+    save_preferences()
 
     # If the accent changed (e.g. American → British), we need to reload the
     # Kokoro pipeline because the accent is set when the pipeline is created.
@@ -673,8 +717,7 @@ def speak_text(text):
 
     except Exception as e:
         log(f"TTS error: {e}")
-        import traceback
-        traceback.print_exc()
+        write_error_log(e)
         play_error_sound()
         update_tray_icon("error")
         time.sleep(2)
@@ -758,8 +801,7 @@ def on_read_selected():
 
     except Exception as e:
         log(f"ERROR in on_read_selected: {e}")
-        import traceback
-        traceback.print_exc()
+        write_error_log(e)
         play_error_sound()
 
 
@@ -777,8 +819,7 @@ def on_ocr_region():
         ocr_requested = True
     except Exception as e:
         log(f"ERROR in on_ocr_region: {e}")
-        import traceback
-        traceback.print_exc()
+        write_error_log(e)
 
 
 _overlay_root = None  # Module-level reference prevents premature garbage collection
@@ -966,6 +1007,7 @@ def ocr_and_speak(screenshot_image):
 
     except Exception as e:
         log(f"OCR error: {e}")
+        write_error_log(e)
         play_error_sound()
         is_processing = False
         update_tray_icon("ready")
@@ -997,6 +1039,7 @@ def on_speed_up():
     if current_speed < SPEED_MAX:
         current_speed = round(current_speed + SPEED_STEP, 2)
         log(f"Speed: {current_speed}x")
+        save_preferences()
         winsound.Beep(1000 + int(current_speed * 200), 50)  # Higher pitch = faster
     else:
         log(f"Speed: {current_speed}x (already at maximum)")
@@ -1007,6 +1050,7 @@ def on_speed_down():
     if current_speed > SPEED_MIN:
         current_speed = round(current_speed - SPEED_STEP, 2)
         log(f"Speed: {current_speed}x")
+        save_preferences()
         winsound.Beep(1000 + int(current_speed * 200), 50)  # Lower pitch = slower
     else:
         log(f"Speed: {current_speed}x (already at minimum)")
@@ -1022,6 +1066,9 @@ def main():
     print("  Text-to-Speech Reader Tool")
     print("=" * 50)
     print()
+
+    # Load saved preferences (voice, speed) before starting the engine
+    load_preferences()
 
     # Load the TTS engine
     load_tts_engine()

@@ -5,18 +5,24 @@ A local text-to-speech tool that reads text aloud. Two modes:
 1. **Read selected text** — Select text in any window, press `Ctrl+Alt+R`, and hear it spoken
 2. **OCR screen region** — Press `Ctrl+Alt+O`, drag a box over text on screen, and hear it read (works on images, games, non-selectable text)
 
-Runs 100% offline. Uses **Kokoro** (high-quality, GPU) on desktop or **Piper** (lightweight, CPU) on laptops.
+Runs 100% offline. Uses **Kokoro** (high-quality) or **Piper** (lightweight, CPU).
+
+Works on **Windows, macOS (Apple Silicon), and Linux** from a single script. The OS-specific bits — global hotkeys, the copy shortcut, OCR, and beeps — are handled per platform automatically.
 
 ## Controls
 
-| Key | What it does |
-|-----|-------------|
-| `Ctrl+Alt+R` | Read selected text aloud |
-| `Ctrl+Alt+O` | OCR a screen region, then read aloud |
-| `Ctrl+Alt+Right` | Speed up |
-| `Ctrl+Alt+Left` | Slow down |
-| `Escape` | Stop speaking |
-| Tray icon | Right-click for voice picker and quit |
+The default modifier is **Ctrl+Alt** on Windows/Linux and **Ctrl+Cmd (⌃⌘)** on macOS.
+Every hotkey is configurable in `config.json` (see [Configuration](#configuration)).
+
+| Key (Win/Linux) | Key (macOS) | What it does |
+|-----|-----|-------------|
+| `Ctrl+Alt+R` | `Ctrl+Cmd+R` | Read selected text aloud |
+| `Ctrl+Alt+O` | `Ctrl+Cmd+O` | OCR a screen region, then read aloud |
+| `Ctrl+Alt+→` | `Ctrl+Cmd+→` | Speed up |
+| `Ctrl+Alt+←` | `Ctrl+Cmd+←` | Slow down |
+| `Ctrl+Alt+Q` | `Ctrl+Cmd+Q` | Quit |
+| `Escape` | `Escape` | Stop speaking |
+| Tray icon | _(disabled on macOS)_ | Right-click for voice picker and quit |
 
 ## Setup — Desktop (GPU)
 
@@ -85,6 +91,58 @@ py -3.12 tts_reader.py
 
 The first run downloads the Piper voice model (~60 MB) automatically.
 
+## Setup — macOS (Apple Silicon)
+
+On a Mac, Kokoro runs on the **CPU** (Apple's MPS GPU backend is actually slower for
+this small model and shares the same unified RAM). Expect ~2 GB resident while running,
+generating speech ~5× faster than realtime.
+
+### 1. Install Python 3.12
+
+The system Python (3.9) is too old. Either:
+```
+brew install python@3.12
+```
+or with [uv](https://docs.astral.sh/uv/):
+```
+uv python install 3.12
+```
+
+### 2. Create a venv and install packages
+
+```
+python3.12 -m venv .venv
+./.venv/bin/python -m pip install -r requirements-macos.txt
+```
+
+### 3. Grant permissions
+
+The first time you run it, macOS will prompt for permissions. Grant them to the app you
+launch from (e.g. **Terminal**) in **System Settings → Privacy & Security**:
+
+| Permission | Why |
+|-----------|-----|
+| **Accessibility** | Global hotkeys + simulating the copy shortcut |
+| **Input Monitoring** | Detecting `Ctrl+Alt+...` and `Escape` globally |
+| **Screen Recording** | Capturing the screen region for OCR |
+
+### 4. Run it
+
+```
+./run_tts_reader.command
+```
+(or `./.venv/bin/python tts_reader.py`)
+
+The first run downloads the Kokoro voice model (~350 MB) and an English text-processing
+model automatically.
+
+**macOS notes:**
+- The **system tray is disabled on macOS** (pystray and the OCR overlay can't share the
+  main thread). Quit with **Ctrl+Cmd+Q** or `Ctrl+C` in the terminal, and pick a voice by
+  editing `config.json`.
+- OCR uses **Apple's Vision framework** (built in — no Tesseract needed).
+- The copy hotkey simulates **⌘C** instead of Ctrl+C.
+
 ## Configuration
 
 Per-PC settings are stored in `config.json` (in the same folder as the script). This file is created automatically on first run with default values. It is not tracked by git, so each PC keeps its own copy.
@@ -94,16 +152,24 @@ Per-PC settings are stored in `config.json` (in the same folder as the script). 
     "tts_engine": "kokoro",
     "kokoro_voice": "af_heart",
     "kokoro_speed": 1.0,
-    "piper_model": "voices/en_US-lessac-high.onnx"
+    "kokoro_device": "cpu",
+    "piper_model": "voices/en_US-lessac-high.onnx",
+    "hotkey_read": "ctrl+cmd+r",
+    "hotkey_ocr": "ctrl+cmd+o",
+    "hotkey_speed_up": "ctrl+cmd+right",
+    "hotkey_speed_down": "ctrl+cmd+left",
+    "hotkey_quit": "ctrl+cmd+q"
 }
 ```
 
 | Setting | What it does | Options |
 |---------|-------------|---------|
-| `tts_engine` | Which TTS engine to use | `"kokoro"` (desktop GPU) or `"piper"` (laptop CPU) |
+| `tts_engine` | Which TTS engine to use | `"kokoro"` (high quality) or `"piper"` (lightweight CPU) |
 | `kokoro_voice` | Kokoro voice name | See voice list below |
 | `kokoro_speed` | Speech speed for Kokoro | `1.0` = normal, `1.5` = faster |
+| `kokoro_device` | Compute device for Kokoro | `"cuda"` (NVIDIA desktop), `"cpu"` (macOS / laptops), `"mps"` (Apple GPU, not recommended) |
 | `piper_model` | Path to Piper voice file | Default: `voices/en_US-lessac-high.onnx` |
+| `hotkey_*` | Global hotkey bindings | Combo string like `"ctrl+cmd+r"`. Modifiers: `ctrl`, `alt` (Option on macOS), `cmd` (⌘), `shift`. Keys: letters or `right`/`left`/`up`/`down`. Defaults: Ctrl+Cmd on macOS, Ctrl+Alt on Windows/Linux. |
 
 You only need to include settings you want to change — any missing settings use their defaults.
 
@@ -127,10 +193,10 @@ Full list: https://huggingface.co/hexgrad/Kokoro-82M
 ## How it works
 
 **Mode 1 (Read selected text):**
-You select text in any window. When you press Ctrl+Alt+R, the tool copies the selected text (simulates Ctrl+C), sends it to the TTS engine, and plays the audio through your speakers.
+You select text in any window. When you press Ctrl+Alt+R, the tool copies the selected text (simulates Ctrl+C, or ⌘C on macOS), sends it to the TTS engine, and plays the audio through your speakers.
 
 **Mode 2 (OCR screen region):**
-When you press Ctrl+Alt+O, the screen dims and your cursor becomes a crosshair. Drag a rectangle over any text (even in images or games). When you release, the tool takes a screenshot of that region, runs OCR (using Windows' built-in text recognition), and reads the result aloud.
+When you press Ctrl+Alt+O, the screen dims and your cursor becomes a crosshair. Drag a rectangle over any text (even in images or games). When you release, the tool takes a screenshot of that region, runs OCR (Windows built-in OCR, Apple Vision on macOS, or Tesseract on Linux), and reads the result aloud.
 
 ## Troubleshooting
 
@@ -138,7 +204,10 @@ When you press Ctrl+Alt+O, the screen dims and your cursor becomes a crosshair. 
 Make sure text is actually selected (highlighted) before pressing Ctrl+Alt+R.
 
 **Hotkeys don't work:**
-The tool needs Administrator privileges for global hotkeys. Run via `run_tts_reader.bat` or start your terminal as Administrator.
+Global hotkeys need elevated input access. On **Windows**, run via `run_tts_reader.bat` or start your terminal as Administrator. On **macOS**, grant the launching app (e.g. Terminal) **Accessibility** and **Input Monitoring** in System Settings → Privacy & Security, then restart the app.
+
+**macOS: OCR captures a blank/black image:**
+Grant the launching app **Screen Recording** permission in System Settings → Privacy & Security, then restart it.
 
 **OCR gives wrong text:**
 Windows OCR works best with clear, high-contrast text. Very small text or stylized game fonts may not OCR well.

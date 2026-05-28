@@ -6,13 +6,20 @@ Or press Ctrl+Alt+O to OCR a screen region and read it.
 Press Escape to stop speaking.
 
 Usage:  python tts_reader.py
-        (Run your terminal as Administrator for global hotkey support)
+        Global hotkeys need elevated input access:
+          - Windows: run the terminal as Administrator
+          - macOS:   grant the terminal Accessibility + Input Monitoring, and
+                     Screen Recording (for the OCR screenshot)
+          - Linux:   run with sufficient privileges for input capture
 
-Controls:
-    Ctrl+Alt+R  - Read selected text aloud
-    Ctrl+Alt+O  - OCR a screen region, then read aloud
+Controls (default modifier: Ctrl+Alt on Windows/Linux, Ctrl+Cmd on macOS;
+all rebindable in config.json):
+    <mod>+R     - Read selected text aloud
+    <mod>+O     - OCR a screen region, then read aloud
+    <mod>+Q     - Quit
     Escape      - Stop speaking
     Tray        - Right-click the system tray icon for options and quit
+                  (Windows/Linux; the tray is disabled on macOS)
 """
 
 import os
@@ -23,35 +30,40 @@ import time
 import logging
 import warnings
 import threading
-import winsound
-import ctypes
 import tkinter as tk
 
-# Tell Windows we handle DPI ourselves — give us real pixel coordinates.
-# Without this, multi-monitor setups with different scaling factors report
-# wrong coordinates, causing screenshots to capture the wrong area.
+# ---------------------------------------------------------------------------
+# Platform detection
+# ---------------------------------------------------------------------------
+# This tool started life on Windows and now also runs on macOS (and Linux).
+# The OS-specific pieces — global hotkeys, the "copy" shortcut, OCR, beeps,
+# DPI — are branched on these flags. The TTS engine, audio streaming, and
+# the WSOLA time-stretch are identical on every platform.
+IS_WINDOWS = sys.platform.startswith("win")
+IS_MAC = sys.platform == "darwin"
+IS_LINUX = sys.platform.startswith("linux")
+
+# Windows only: declare per-monitor-v2 DPI awareness so screenshots report
+# real pixel coordinates on multi-monitor / mixed-scaling setups.
 #
 # There are three levels of DPI awareness on Windows:
 #   1. SetProcessDPIAware() — only knows the PRIMARY monitor's scaling.
-#      Secondary monitors with different scaling get wrong coordinates.
 #   2. SetProcessDpiAwareness(2) — per-monitor aware (Windows 8.1+).
 #   3. SetProcessDpiAwarenessContext(-4) — per-monitor aware v2 (Windows 10 1703+).
-#      This is the best option: gives correct physical pixel coordinates on ALL monitors.
-#
-# We try the best one first and fall back to weaker options on older Windows.
-# IMPORTANT: This must happen before importing mss or pyautogui, because
-# Windows only allows setting DPI awareness ONCE per process — whichever
-# library sets it first wins, and the others can't change it.
-try:
-    ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
-except (AttributeError, OSError):
+# We try the best one first and fall back on older Windows. macOS and Linux
+# already hand us correct coordinates, so this whole block is a no-op there.
+if IS_WINDOWS:
+    import ctypes
     try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
     except (AttributeError, OSError):
         try:
-            ctypes.windll.user32.SetProcessDPIAware()
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
         except (AttributeError, OSError):
-            pass
+            try:
+                ctypes.windll.user32.SetProcessDPIAware()
+            except (AttributeError, OSError):
+                pass
 
 # Suppress noisy warnings from libraries before importing them
 warnings.filterwarnings("ignore", category=UserWarning, module="torch")
@@ -61,13 +73,24 @@ logging.getLogger("transformers").setLevel(logging.ERROR)
 
 import numpy as np
 import sounddevice as sd
-import keyboard
 import pyperclip
-import mss              # Multi-monitor screenshot library — must be imported BEFORE pyautogui
-import pyautogui
+import mss              # Cross-platform multi-monitor screenshots (Windows GDI / macOS CG / X11)
 from PIL import Image   # Used to convert mss screenshots to PIL format for OCR
 
-# Try to import system tray libraries (optional — script works without them)
+# Global-hotkey + synthetic-keystroke backend.
+#   Windows: the `keyboard` library (proven here; needs Administrator).
+#   macOS / Linux: `pynput` (needs Accessibility / Input Monitoring permission).
+# pyautogui is only used to simulate the copy shortcut on Windows; on macOS/Linux
+# we synthesize the copy keystroke with pynput, so pyautogui isn't needed there.
+if IS_WINDOWS:
+    import keyboard
+    import pyautogui
+else:
+    from pynput import keyboard as pynput_keyboard
+
+# Try to import system tray libraries (optional — script works without them).
+# NOTE: the tray is intentionally disabled on macOS (see main()) because pystray
+# and tkinter both need the main thread's run loop there and can't share it.
 try:
     from PIL import ImageDraw
     import pystray
@@ -87,12 +110,35 @@ except ImportError:
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
 
+# Default global-hotkey modifier, per platform.
+#   macOS: Ctrl+Cmd (⌃⌘) — comfortable and low-conflict. ("alt" = the Option
+#          key on a Mac, which is awkward / often unlabelled, so we avoid it.)
+#   Windows/Linux: Ctrl+Alt.
+# These are just defaults — every hotkey can be overridden in config.json.
+_DEFAULT_MOD = "ctrl+cmd" if IS_MAC else "ctrl+alt"
+
 # Default values (used when config.json is missing or incomplete)
 DEFAULTS = {
     "tts_engine": "kokoro",
     "kokoro_voice": "af_heart",
     "kokoro_speed": 1.0,
+    # Device for Kokoro/PyTorch. Per machine:
+    #   "cpu"  -> works everywhere; best choice on Apple Silicon (MPS is slower
+    #             for an 82M model and shares the same unified RAM).
+    #   "cuda" -> NVIDIA GPU (the Windows desktop) — runs in dedicated VRAM.
+    #   "mps"  -> Apple GPU; supported but not recommended here (see above).
+    # Default is platform-aware: cuda on Windows (the desktop has an NVIDIA GPU),
+    # cpu elsewhere. Override per machine via config.json.
+    "kokoro_device": "cuda" if IS_WINDOWS else "cpu",
     "piper_model": "voices/en_US-lessac-high.onnx",
+    # Global hotkeys. Combo syntax: "+"-separated, e.g. "ctrl+cmd+r".
+    # Recognized modifiers: ctrl, alt (Option on macOS), cmd (⌘), shift.
+    # Keys: letters, or right/left/up/down/space/enter/tab.
+    "hotkey_read": f"{_DEFAULT_MOD}+r",          # Read selected text aloud
+    "hotkey_ocr": f"{_DEFAULT_MOD}+o",           # OCR a screen region, then read
+    "hotkey_speed_up": f"{_DEFAULT_MOD}+right",  # Increase speech speed
+    "hotkey_speed_down": f"{_DEFAULT_MOD}+left", # Decrease speech speed
+    "hotkey_quit": f"{_DEFAULT_MOD}+q",          # Quit
 }
 
 def load_config():
@@ -119,13 +165,15 @@ _config = load_config()
 TTS_ENGINE = _config["tts_engine"]
 KOKORO_VOICE = _config["kokoro_voice"]
 KOKORO_SPEED = _config["kokoro_speed"]
+KOKORO_DEVICE = _config["kokoro_device"]
 PIPER_MODEL = _config["piper_model"]
 
-# Hotkeys (same on all PCs)
-HOTKEY_READ = "ctrl+alt+r"          # Read selected text aloud
-HOTKEY_OCR = "ctrl+alt+o"           # OCR a screen region, then read aloud
-HOTKEY_SPEED_UP = "ctrl+alt+right"      # Increase speech speed
-HOTKEY_SPEED_DOWN = "ctrl+alt+left"     # Decrease speech speed
+# Hotkeys (configurable per machine via config.json; defaults set above)
+HOTKEY_READ = _config["hotkey_read"]
+HOTKEY_OCR = _config["hotkey_ocr"]
+HOTKEY_SPEED_UP = _config["hotkey_speed_up"]
+HOTKEY_SPEED_DOWN = _config["hotkey_speed_down"]
+HOTKEY_QUIT = _config["hotkey_quit"]
 
 # --- Other settings (not in config.json) ---
 KOKORO_LANG = "a"              # "a" = American English, "b" = British English
@@ -236,45 +284,148 @@ def load_preferences():
 
 
 # ---------------------------------------------------------------------------
+# Platform input layer (global hotkeys + synthetic "copy" keystroke)
+# ---------------------------------------------------------------------------
+# Windows uses the `keyboard` library; macOS/Linux use `pynput`. These helpers
+# hide that difference so the rest of the code stays platform-agnostic.
+_pynput_hotkeys = None   # pynput GlobalHotKeys listener (macOS/Linux)
+_kb_controller = None    # pynput Controller for synthesizing key presses
+
+def _controller():
+    """Lazily create the pynput keyboard Controller (macOS/Linux)."""
+    global _kb_controller
+    if _kb_controller is None:
+        _kb_controller = pynput_keyboard.Controller()
+    return _kb_controller
+
+def _combo_to_pynput(combo):
+    """Convert a 'ctrl+alt+r' style combo to pynput's '<ctrl>+<alt>+r' syntax."""
+    specials = {"ctrl", "alt", "shift", "cmd", "right", "left", "up", "down",
+                "esc", "space", "enter", "tab"}
+    return "+".join(f"<{p}>" if p in specials else p for p in combo.split("+"))
+
+def _pretty_combo(combo):
+    """Human-readable form of a combo, e.g. 'ctrl+cmd+r' -> 'Ctrl+Cmd+R'."""
+    names = {"ctrl": "Ctrl", "alt": "Alt", "cmd": "Cmd", "shift": "Shift",
+             "right": "Right", "left": "Left", "up": "Up", "down": "Down",
+             "space": "Space", "enter": "Enter", "tab": "Tab", "esc": "Esc"}
+    return "+".join(names.get(p, p.upper()) for p in combo.split("+"))
+
+def register_hotkeys(specs, esc_callback):
+    """Register global hotkeys. `specs` is a list of (combo, callback) pairs.
+    `esc_callback` fires when Escape is pressed (it is passed one argument,
+    which it may ignore — matches the `keyboard` library's event signature)."""
+    global _pynput_hotkeys
+    if IS_WINDOWS:
+        for combo, cb in specs:
+            keyboard.add_hotkey(combo, cb, suppress=False)
+        keyboard.on_press_key("esc", esc_callback)
+    else:
+        mapping = {_combo_to_pynput(combo): cb for combo, cb in specs}
+        mapping["<esc>"] = lambda: esc_callback(None)
+        _pynput_hotkeys = pynput_keyboard.GlobalHotKeys(mapping)
+        _pynput_hotkeys.start()
+
+def unregister_hotkeys():
+    """Tear down all registered global hotkeys."""
+    if IS_WINDOWS:
+        keyboard.unhook_all()
+    elif _pynput_hotkeys is not None:
+        _pynput_hotkeys.stop()
+
+def release_modifiers():
+    """Release the hotkey modifiers so they don't contaminate the synthetic
+    copy shortcut. The user may still be physically holding them when the
+    callback fires; we send synthetic key-ups so the OS sees a clean copy.
+    On macOS we also release Cmd, because the hotkey itself uses Cmd and the
+    copy we're about to send is Cmd+C — we want a fresh Cmd press for that."""
+    if IS_WINDOWS:
+        keyboard.release("ctrl")
+        keyboard.release("alt")
+    else:
+        mods = [pynput_keyboard.Key.ctrl, pynput_keyboard.Key.alt,
+                pynput_keyboard.Key.shift]
+        if IS_MAC:
+            mods.append(pynput_keyboard.Key.cmd)
+        for k in mods:
+            try:
+                _controller().release(k)
+            except Exception:
+                pass
+
+def send_copy():
+    """Simulate the platform copy shortcut: Cmd+C on macOS, Ctrl+C elsewhere."""
+    if IS_WINDOWS:
+        pyautogui.hotkey("ctrl", "c")
+    else:
+        mod = pynput_keyboard.Key.cmd if IS_MAC else pynput_keyboard.Key.ctrl
+        c = _controller()
+        with c.pressed(mod):
+            c.press("c")
+            c.release("c")
+
+
+# ---------------------------------------------------------------------------
 # Sound feedback
 # ---------------------------------------------------------------------------
+# Originally used winsound.Beep (Windows-only). Replaced with sine tones
+# synthesized via numpy and played through sounddevice, so the exact same
+# feedback works on Windows, macOS, and Linux.
+def _tone(freq, ms, volume=0.2):
+    """Play a single short sine-wave beep (blocking). Never raises.
+    Refreshes PortAudio and retries once if the first attempt fails (the
+    AirPods-reconnect case — see _refresh_audio_devices)."""
+    try:
+        sr = 44100
+        n = int(sr * ms / 1000.0)
+        if n <= 0:
+            return
+        t = np.arange(n, dtype=np.float32) / sr
+        wave = (volume * np.sin(2.0 * np.pi * freq * t)).astype(np.float32)
+        # Short fade in/out to avoid audible clicks at the edges.
+        fade = min(int(sr * 0.005), n // 2)
+        if fade > 0:
+            env = np.ones(n, dtype=np.float32)
+            env[:fade] = np.linspace(0.0, 1.0, fade, dtype=np.float32)
+            env[-fade:] = np.linspace(1.0, 0.0, fade, dtype=np.float32)
+            wave *= env
+        try:
+            sd.play(wave, sr, blocking=True)
+            sd.wait()
+        except Exception:
+            _refresh_audio_devices()
+            sd.play(wave, sr, blocking=True)
+            sd.wait()
+    except Exception:
+        pass  # A failed beep must never crash the tool.
+
+def _beep_sequence(notes):
+    """Play a list of (freq_hz, duration_ms) tones in a daemon thread."""
+    def _run():
+        for freq, ms in notes:
+            _tone(freq, ms)
+            time.sleep(0.02)
+    threading.Thread(target=_run, daemon=True).start()
+
 def play_start_sound():
     """Two quick rising tones — starting to speak."""
-    def _beep():
-        winsound.Beep(880, 80)
-        time.sleep(0.03)
-        winsound.Beep(1100, 80)
-    threading.Thread(target=_beep, daemon=True).start()
+    _beep_sequence([(880, 80), (1100, 80)])
 
 def play_done_sound():
     """Short high click — finished speaking."""
-    threading.Thread(target=lambda: winsound.Beep(1200, 50), daemon=True).start()
+    _beep_sequence([(1200, 50)])
 
 def play_stop_sound():
     """Descending tone — speech stopped by user."""
-    def _beep():
-        winsound.Beep(900, 80)
-        time.sleep(0.03)
-        winsound.Beep(600, 80)
-    threading.Thread(target=_beep, daemon=True).start()
+    _beep_sequence([(900, 80), (600, 80)])
 
 def play_error_sound():
     """Quick double low-beep — something went wrong or no text found."""
-    def _beep():
-        winsound.Beep(200, 100)
-        time.sleep(0.05)
-        winsound.Beep(200, 100)
-    threading.Thread(target=_beep, daemon=True).start()
+    _beep_sequence([(200, 100), (200, 100)])
 
 def play_ocr_ready_sound():
     """Three quick ascending tones — OCR overlay opened."""
-    def _beep():
-        winsound.Beep(700, 50)
-        time.sleep(0.03)
-        winsound.Beep(900, 50)
-        time.sleep(0.03)
-        winsound.Beep(1100, 50)
-    threading.Thread(target=_beep, daemon=True).start()
+    _beep_sequence([(700, 50), (900, 50), (1100, 50)])
 
 
 # ---------------------------------------------------------------------------
@@ -352,7 +503,8 @@ def change_voice(voice_id):
             global tts_engine_obj
             try:
                 from kokoro import KPipeline
-                tts_engine_obj = KPipeline(lang_code=new_lang, repo_id="hexgrad/Kokoro-82M")
+                tts_engine_obj = KPipeline(lang_code=new_lang, repo_id="hexgrad/Kokoro-82M",
+                                           device=KOKORO_DEVICE)
                 log(f"Pipeline reloaded for accent '{new_lang}'.")
             except Exception as e:
                 log(f"Failed to reload pipeline: {e}")
@@ -430,8 +582,9 @@ def load_tts_engine():
         log("Loading Kokoro TTS engine...")
         try:
             from kokoro import KPipeline
-            tts_engine_obj = KPipeline(lang_code=current_lang, repo_id="hexgrad/Kokoro-82M")
-            log(f"Kokoro loaded! Voice: {current_voice}")
+            tts_engine_obj = KPipeline(lang_code=current_lang, repo_id="hexgrad/Kokoro-82M",
+                                       device=KOKORO_DEVICE)
+            log(f"Kokoro loaded! Voice: {current_voice}, Device: {KOKORO_DEVICE}")
         except Exception as e:
             log(f"Failed to load Kokoro: {e}")
             log("Make sure kokoro and espeak-ng are installed (see README).")
@@ -678,6 +831,40 @@ class StopSpeaking(Exception):
 PLAYBACK_CHUNK_SAMPLES = 7200
 
 
+def _refresh_audio_devices():
+    """Tear down and re-initialize PortAudio so it picks up the *current* set
+    of audio devices. PortAudio enumerates devices once at startup and caches
+    them; if the device set changes mid-process (most commonly on macOS when a
+    Bluetooth device — AirPods, headphones — disconnects and reconnects) those
+    cached handles go stale and stream-open fails with CoreAudio -10851 /
+    PortAudio -9986. Reinitializing is the supported recovery."""
+    try:
+        sd._terminate()
+    except Exception:
+        pass
+    try:
+        sd._initialize()
+    except Exception:
+        pass
+
+
+def _open_output_stream(sample_rate):
+    """Open a sounddevice OutputStream, refreshing PortAudio's device list and
+    retrying once if the first attempt fails (typical after a Bluetooth
+    disconnect/reconnect on macOS — see _refresh_audio_devices)."""
+    try:
+        s = sd.OutputStream(samplerate=sample_rate, channels=1, dtype="float32")
+        s.start()
+        return s
+    except Exception as first:
+        log(f"Audio device open failed ({first.__class__.__name__}: {first}); "
+            f"refreshing audio devices and retrying...")
+        _refresh_audio_devices()
+        s = sd.OutputStream(samplerate=sample_rate, channels=1, dtype="float32")
+        s.start()
+        return s
+
+
 def play_audio_stream(chunks_generator, sample_rate):
     """Play audio chunks through the speakers as they arrive from the TTS engine.
 
@@ -707,8 +894,9 @@ def play_audio_stream(chunks_generator, sample_rate):
 
     threading.Thread(target=producer, daemon=True).start()
 
-    stream = sd.OutputStream(samplerate=sample_rate, channels=1, dtype="float32")
-    stream.start()
+    # Open the speaker. _open_output_stream auto-recovers from stale PortAudio
+    # device caches (the AirPods reconnect case on macOS).
+    stream = _open_output_stream(sample_rate)
 
     try:
         while True:
@@ -805,12 +993,11 @@ def on_read_selected():
 
         log("Grabbing selected text...")
 
-        # Release Ctrl and Alt so they don't interfere with the Ctrl+C we're
-        # about to simulate. The user's fingers may still be on these keys
-        # from the Ctrl+Alt+R hotkey combo. Without this, the OS might see
-        # Ctrl+Alt+C instead of Ctrl+C, which isn't a copy shortcut.
-        keyboard.release("ctrl")
-        keyboard.release("alt")
+        # Release Ctrl and Alt so they don't interfere with the copy shortcut
+        # we're about to simulate. The user's fingers may still be on these
+        # keys from the Ctrl+Alt+R combo. Without this, the OS might see
+        # Ctrl+Alt+C instead of a clean copy.
+        release_modifiers()
         log("  Released modifier keys")
 
         # Save the current clipboard so we can restore it after
@@ -820,16 +1007,17 @@ def on_read_selected():
             old_clipboard = ""
         log("  Saved clipboard")
 
-        # Clear the clipboard first — this way we can tell if Ctrl+C actually copied
-        # something new, vs. just reading whatever was already on the clipboard
+        # Clear the clipboard first — this way we can tell if the copy actually
+        # grabbed something new, vs. just reading whatever was already there.
         try:
             pyperclip.copy("")
         except Exception:
             pass
 
-        # Simulate Ctrl+C to copy whatever is selected
-        log("  Simulating Ctrl+C...")
-        pyautogui.hotkey("ctrl", "c")
+        # Simulate the copy shortcut (Cmd+C on macOS, Ctrl+C elsewhere) to
+        # copy whatever is selected.
+        log("  Simulating copy shortcut...")
+        send_copy()
         time.sleep(0.25)  # Wait for the clipboard to update (slightly longer for safety)
 
         # Read the copied text
@@ -837,7 +1025,7 @@ def on_read_selected():
             text = pyperclip.paste()
         except Exception:
             text = ""
-        log(f'  Clipboard after Ctrl+C: "{text[:80] if text else ""}"')
+        log(f'  Clipboard after copy: "{text[:80] if text else ""}"')
 
         # Restore the original clipboard
         try:
@@ -847,7 +1035,8 @@ def on_read_selected():
 
         # Check if we got anything useful
         if not text or not text.strip():
-            log("No text selected (clipboard was empty after Ctrl+C).")
+            log("No text copied (clipboard empty after copy). If macOS printed "
+                "'process is not trusted', grant this app Accessibility permission.")
             play_error_sound()
             return
 
@@ -897,28 +1086,20 @@ def open_region_selector():
     root = tk.Tk()
     _overlay_root = root  # Keep a reference so GC doesn't clean it up on a random thread
 
-    # Span ALL monitors, not just the primary one.
-    # "-fullscreen" only covers the primary monitor in tkinter.
-    # Instead, we manually size the window to cover the entire virtual screen
-    # (the bounding box of all monitors combined).
-    screen_left = root.winfo_vrootx()
-    screen_top = root.winfo_vrooty()
-
-    # Use pyautogui to get the full virtual screen size (all monitors)
-    total_width, total_height = pyautogui.size()
-
-    # On multi-monitor setups, the virtual screen can start at negative coordinates
-    # (if a monitor is to the left of the primary). We need the actual bounds.
-    try:
-        user32 = ctypes.windll.user32
-        # SM_XVIRTUALSCREEN (76) = left edge, SM_YVIRTUALSCREEN (77) = top edge
-        # SM_CXVIRTUALSCREEN (78) = total width, SM_CYVIRTUALSCREEN (79) = total height
-        screen_left = user32.GetSystemMetrics(76)
-        screen_top = user32.GetSystemMetrics(77)
-        total_width = user32.GetSystemMetrics(78)
-        total_height = user32.GetSystemMetrics(79)
-    except Exception:
-        pass  # Fall back to pyautogui.size() if this fails
+    # Span ALL monitors, not just the primary one. tkinter's "-fullscreen"
+    # only covers the primary monitor, so we size the window to the entire
+    # virtual screen (the bounding box of every monitor combined).
+    #
+    # mss.monitors[0] is exactly that bounding box on every platform, and it
+    # correctly handles monitors positioned to the left of / above the primary
+    # (which start at negative coordinates). This replaces the old Windows-only
+    # GetSystemMetrics path and works identically on Windows, macOS, and Linux.
+    with mss.mss() as _sct:
+        vmon = _sct.monitors[0]
+    screen_left = vmon["left"]
+    screen_top = vmon["top"]
+    total_width = vmon["width"]
+    total_height = vmon["height"]
 
     root.overrideredirect(True)  # Remove window borders/title bar
     root.geometry(f"{total_width}x{total_height}+{screen_left}+{screen_top}")
@@ -1023,8 +1204,12 @@ def open_region_selector():
     canvas.bind("<B1-Motion>", on_mouse_drag)
     canvas.bind("<ButtonRelease-1>", on_mouse_up)
     root.bind("<Escape>", on_escape)
-    # Also register with keyboard library as a backup — fires even without focus
-    esc_hook[0] = keyboard.on_press_key("esc", on_overlay_escape)
+    # On Windows, also register a global Esc hook via the `keyboard` library as
+    # a backup that fires even if the overlay loses focus. On macOS/Linux the
+    # overlay grabs focus so the tkinter binding above handles Escape (and the
+    # global pynput Esc hotkey remains active as a further fallback).
+    if IS_WINDOWS:
+        esc_hook[0] = keyboard.on_press_key("esc", on_overlay_escape)
 
     root.mainloop()
 
@@ -1039,6 +1224,54 @@ def open_region_selector():
     # It gets destroyed on the main thread at the start of the NEXT OCR capture.
 
 
+def run_ocr(pil_image):
+    """Recognize text in a PIL image using the platform's OCR engine.
+
+    Windows: winocr (Windows.Media.Ocr).
+    macOS:   Apple's Vision framework (built in, high quality, no extra binary).
+    Linux:   Tesseract via pytesseract (requires the `tesseract` binary).
+    """
+    if IS_WINDOWS:
+        from winocr import recognize_pil_sync
+        return recognize_pil_sync(pil_image, lang=OCR_LANGUAGE)["text"].strip()
+    if IS_MAC:
+        return _macos_vision_ocr(pil_image)
+    import pytesseract  # Linux
+    return pytesseract.image_to_string(pil_image).strip()
+
+
+def _macos_vision_ocr(pil_image):
+    """OCR via Apple's Vision framework (VNRecognizeTextRequest)."""
+    import io
+    import Quartz
+    import Vision
+    from Foundation import NSData
+
+    # Hand the image to Vision as PNG bytes -> CGImage.
+    buf = io.BytesIO()
+    pil_image.convert("RGB").save(buf, format="PNG")
+    png = buf.getvalue()
+    data = NSData.dataWithBytes_length_(png, len(png))
+    src = Quartz.CGImageSourceCreateWithData(data, None)
+    if src is None:
+        return ""
+    cg_image = Quartz.CGImageSourceCreateImageAtIndex(src, 0, None)
+
+    request = Vision.VNRecognizeTextRequest.alloc().init()
+    request.setRecognitionLevel_(1)          # 1 = accurate, 0 = fast
+    request.setUsesLanguageCorrection_(True)
+
+    handler = Vision.VNImageRequestHandler.alloc().initWithCGImage_options_(cg_image, None)
+    handler.performRequests_error_([request], None)
+
+    lines = []
+    for observation in (request.results() or []):
+        candidates = observation.topCandidates_(1)
+        if candidates and len(candidates) > 0:
+            lines.append(candidates[0].string())
+    return "\n".join(lines).strip()
+
+
 def ocr_and_speak(screenshot_image):
     """Run OCR on a screenshot image and speak the result."""
     global is_processing
@@ -1048,9 +1281,7 @@ def ocr_and_speak(screenshot_image):
     log("Running OCR on captured region...")
 
     try:
-        from winocr import recognize_pil_sync
-        result = recognize_pil_sync(screenshot_image, lang=OCR_LANGUAGE)
-        text = result["text"].strip()
+        text = run_ocr(screenshot_image).strip()
 
         if not text:
             log("OCR found no text in the selected region.")
@@ -1098,7 +1329,7 @@ def on_speed_up():
         current_speed = round(current_speed + SPEED_STEP, 2)
         log(f"Speed: {current_speed}x")
         save_preferences()
-        winsound.Beep(1000 + int(current_speed * 200), 50)  # Higher pitch = faster
+        _beep_sequence([(1000 + int(current_speed * 200), 50)])  # Higher pitch = faster
     else:
         log(f"Speed: {current_speed}x (already at maximum)")
 
@@ -1109,7 +1340,7 @@ def on_speed_down():
         current_speed = round(current_speed - SPEED_STEP, 2)
         log(f"Speed: {current_speed}x")
         save_preferences()
-        winsound.Beep(1000 + int(current_speed * 200), 50)  # Lower pitch = slower
+        _beep_sequence([(1000 + int(current_speed * 200), 50)])  # Lower pitch = slower
     else:
         log(f"Speed: {current_speed}x (already at minimum)")
 
@@ -1132,31 +1363,47 @@ def main():
     load_tts_engine()
     print()
 
-    # Start the system tray icon
-    if TRAY_AVAILABLE:
+    # Start the system tray icon.
+    # On macOS the tray is intentionally disabled: pystray's AppKit backend and
+    # tkinter both need the main thread's run loop and can't share it, and the
+    # OCR overlay needs that main thread. Quit with the quit hotkey (or Ctrl+C
+    # in this terminal) and pick a voice by editing config.json.
+    tray_enabled = TRAY_AVAILABLE and not IS_MAC
+    if tray_enabled:
         start_tray_icon()
         log("System tray icon started (look near your clock).")
+    elif IS_MAC:
+        log(f"Tray disabled on macOS — quit with {_pretty_combo(HOTKEY_QUIT)} or "
+            f"Ctrl+C; set voice in config.json.")
     else:
         log("Running without tray icon.")
 
-    # Print controls
-    print(f"  Press  Ctrl+Alt+R         to read selected text aloud")
-    print(f"  Press  Ctrl+Alt+O         to OCR a screen region")
-    print(f"  Press  Ctrl+Alt+Right     to speed up")
-    print(f"  Press  Ctrl+Alt+Left      to slow down")
-    print(f"  Press  Escape             to stop speaking")
-    print(f"  Right-click tray icon to quit")
+    # Print controls (reflect the actual configured hotkeys)
+    print(f"  {_pretty_combo(HOTKEY_READ):<16} read selected text aloud")
+    print(f"  {_pretty_combo(HOTKEY_OCR):<16} OCR a screen region")
+    print(f"  {_pretty_combo(HOTKEY_SPEED_UP):<16} speed up")
+    print(f"  {_pretty_combo(HOTKEY_SPEED_DOWN):<16} slow down")
+    print(f"  {_pretty_combo(HOTKEY_QUIT):<16} quit")
+    print(f"  {'Esc':<16} stop speaking")
+    if not IS_MAC and TRAY_AVAILABLE:
+        print(f"  {'Tray':<16} right-click to quit or change voice")
     print()
     log(f"Ready! Engine: {TTS_ENGINE}, Speed: {current_speed}x")
     print()
 
-    # Register hotkeys
-    keyboard.add_hotkey(HOTKEY_READ, on_read_selected, suppress=False)
-    keyboard.add_hotkey(HOTKEY_OCR, on_ocr_region, suppress=False)
-    keyboard.add_hotkey(HOTKEY_SPEED_UP, on_speed_up, suppress=False)
-    keyboard.add_hotkey(HOTKEY_SPEED_DOWN, on_speed_down, suppress=False)
-    keyboard.on_press_key("esc", on_stop)
-    log(f"Hotkeys registered: {HOTKEY_READ}, {HOTKEY_OCR}, {HOTKEY_SPEED_UP}, {HOTKEY_SPEED_DOWN}, Escape")
+    # Register global hotkeys (via the platform input layer).
+    register_hotkeys(
+        [
+            (HOTKEY_READ, on_read_selected),
+            (HOTKEY_OCR, on_ocr_region),
+            (HOTKEY_SPEED_UP, on_speed_up),
+            (HOTKEY_SPEED_DOWN, on_speed_down),
+            (HOTKEY_QUIT, quit_from_tray),
+        ],
+        on_stop,
+    )
+    log(f"Hotkeys registered: {HOTKEY_READ}, {HOTKEY_OCR}, {HOTKEY_SPEED_UP}, "
+        f"{HOTKEY_SPEED_DOWN}, {HOTKEY_QUIT}, Escape")
 
     # Main loop
     try:
@@ -1170,7 +1417,7 @@ def main():
         pass
 
     # Cleanup
-    keyboard.unhook_all()
+    unregister_hotkeys()
     if tray_icon is not None:
         try:
             tray_icon.stop()

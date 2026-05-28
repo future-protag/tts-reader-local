@@ -1,0 +1,41 @@
+# macOS dependencies for tts_reader.py (Apple Silicon, Python 3.12)
+#
+# Install into a venv:
+#   python3.12 -m venv .venv
+#   ./.venv/bin/python -m pip install -r requirements-macos.txt
+#
+# (or with uv:  uv venv --python 3.12 .venv
+#               uv pip install --python .venv/bin/python -r requirements-macos.txt)
+
+# --- TTS engine: Kokoro ---
+# Runs on CPU on Apple Silicon. Keep "kokoro_device": "cpu" in config.json —
+# MPS is slower for an 82M model and shares the same unified RAM (~2 GB resident).
+torch
+kokoro>=0.9.4
+soundfile
+
+# --- Audio + utilities (cross-platform) ---
+numpy
+sounddevice
+pyperclip
+mss
+Pillow
+
+# --- Global hotkeys + synthetic keystrokes ---
+# Needs macOS Accessibility + Input Monitoring permission for the launching app.
+pynput
+
+# --- OCR: Apple Vision (built into macOS, no extra binary) ---
+# Screenshots need Screen Recording permission for the launching app.
+pyobjc-framework-Vision
+pyobjc-framework-Quartz
+pyobjc-framework-Cocoa
+
+# --- Optional system tray ---
+# Disabled at runtime on macOS (pystray + tkinter can't share the main thread),
+# but harmless to have installed.
+pystray
+
+# --- Optional: lightweight CPU engine alternative ---
+# Set "tts_engine": "piper" in config.json to use it instead of Kokoro.
+# piper-tts

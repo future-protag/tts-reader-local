@@ -16,3 +16,6 @@ venv/
 
 # HuggingFace model cache
 .cache/
+
+# Per-machine runtime crash log (written by the tool on errors)
+error_log.txt

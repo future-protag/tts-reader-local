@@ -19,3 +19,6 @@ venv/
 
 # Per-machine runtime crash log (written by the tool on errors)
 error_log.txt
+
+# macOS Finder metadata
+.DS_Store

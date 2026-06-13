@@ -71,12 +71,12 @@ as Administrator.
 ### Desktop (Kokoro — needs GPU)
 1. Install Python 3.12: `py install 3.12`
 2. `py -3.12 -m pip install torch --index-url https://download.pytorch.org/whl/cu128`
-3. `py -3.12 -m pip install kokoro>=0.9.4 soundfile sounddevice numpy keyboard pyperclip pyautogui mss pystray Pillow winocr`
+3. `py -3.12 -m pip install kokoro>=0.9.4 soundfile sounddevice numpy pyperclip pyautogui pynput mss pystray Pillow winocr winrt-Windows.Media.Control`
 4. espeak-ng is bundled with kokoro's `espeakng-loader` package (no separate install needed)
 
 ### Laptop (Piper — CPU only)
 1. Install Python 3.12: `py install 3.12`
-2. `py -3.12 -m pip install piper-tts sounddevice numpy keyboard pyperclip pyautogui mss pystray Pillow winocr`
+2. `py -3.12 -m pip install piper-tts sounddevice numpy pyperclip pyautogui pynput mss pystray Pillow winocr winrt-Windows.Media.Control`
 3. Change `TTS_ENGINE = "piper"` at top of `tts_reader.py`
 4. Voice model auto-downloads on first run
 

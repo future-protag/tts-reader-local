@@ -28,6 +28,8 @@ Every hotkey is configurable in `config.json` (see [Configuration](#configuratio
 
 Your desktop uses Kokoro, which needs an NVIDIA GPU and Python 3.12.
 
+> **Why 3.12 and not newer?** As of June 2026 the `kokoro` and `misaki` packages still cap at Python 3.12 — 3.13+ won't install. Stay on 3.12. (If you ever truly need 3.13, the third-party `kokoro-onnx` package supports it, but that's an engine swap, not a drop-in.)
+
 ### 1. Install Python 3.12
 
 If you don't have it yet:
@@ -41,10 +43,12 @@ py install 3.12
 py -3.12 -m pip install torch --index-url https://download.pytorch.org/whl/cu128
 ```
 
+> `cu128` works fine on the RTX 5080. For a fresh install you can also use the newer `cu130` index (PyTorch 2.9+); both work, so there's no need to reinstall just to switch.
+
 ### 3. Install the other packages
 
 ```
-py -3.12 -m pip install kokoro>=0.9.4 soundfile sounddevice numpy keyboard pyperclip pyautogui mss pystray Pillow winocr
+py -3.12 -m pip install kokoro>=0.9.4 soundfile sounddevice numpy pyperclip pyautogui pynput mss pystray Pillow winocr winrt-Windows.Media.Control
 ```
 
 ### 4. Run it
@@ -71,7 +75,7 @@ py install 3.12
 ### 2. Install packages
 
 ```
-py -3.12 -m pip install piper-tts sounddevice numpy keyboard pyperclip pyautogui mss pystray Pillow winocr
+py -3.12 -m pip install piper-tts sounddevice numpy pyperclip pyautogui pynput mss pystray Pillow winocr winrt-Windows.Media.Control
 ```
 
 ### 3. Edit the config
@@ -154,6 +158,7 @@ Per-PC settings are stored in `config.json` (in the same folder as the script). 
     "kokoro_speed": 1.0,
     "kokoro_device": "cpu",
     "piper_model": "voices/en_US-lessac-high.onnx",
+    "pause_other_media": true,
     "hotkey_read": "ctrl+cmd+r",
     "hotkey_ocr": "ctrl+cmd+o",
     "hotkey_speed_up": "ctrl+cmd+right",
@@ -169,6 +174,7 @@ Per-PC settings are stored in `config.json` (in the same folder as the script). 
 | `kokoro_speed` | Speech speed for Kokoro | `1.0` = normal, `1.5` = faster |
 | `kokoro_device` | Compute device for Kokoro | `"cuda"` (NVIDIA desktop), `"cpu"` (macOS / laptops), `"mps"` (Apple GPU, not recommended) |
 | `piper_model` | Path to Piper voice file | Default: `voices/en_US-lessac-high.onnx` |
+| `pause_other_media` | While reading, pause other apps' playing media (Spotify, videos…) and resume them when done. **Windows only** — no-op on macOS/Linux. | `true` (default) or `false` |
 | `hotkey_*` | Global hotkey bindings | Combo string like `"ctrl+cmd+r"`. Modifiers: `ctrl`, `alt` (Option on macOS), `cmd` (⌘), `shift`. Keys: letters or `right`/`left`/`up`/`down`. Defaults: Ctrl+Cmd on macOS, Ctrl+Alt on Windows/Linux. |
 
 You only need to include settings you want to change — any missing settings use their defaults.
@@ -213,4 +219,4 @@ Grant the launching app **Screen Recording** permission in System Settings → P
 Windows OCR works best with clear, high-contrast text. Very small text or stylized game fonts may not OCR well.
 
 **Kokoro fails to load:**
-Make sure `espeak-ng` dependencies are installed. Kokoro's `espeakng-loader` package should handle this automatically, but if not, install espeak-ng manually from: https://github.com/espeak-ng/espeak-ng/releases
+For English you normally don't need to do anything — Kokoro pulls in `espeak-ng` automatically via its `espeakng-loader` dependency. Only if Kokoro still fails to load, install espeak-ng manually from: https://github.com/espeak-ng/espeak-ng/releases (this is mainly relevant for some non-English languages).

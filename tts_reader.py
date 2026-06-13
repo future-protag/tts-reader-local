@@ -27,6 +27,8 @@ import sys
 import json
 import queue
 import time
+import atexit
+import asyncio
 import logging
 import warnings
 import threading
@@ -77,16 +79,18 @@ import pyperclip
 import mss              # Cross-platform multi-monitor screenshots (Windows GDI / macOS CG / X11)
 from PIL import Image   # Used to convert mss screenshots to PIL format for OCR
 
-# Global-hotkey + synthetic-keystroke backend.
-#   Windows: the `keyboard` library (proven here; needs Administrator).
-#   macOS / Linux: `pynput` (needs Accessibility / Input Monitoring permission).
-# pyautogui is only used to simulate the copy shortcut on Windows; on macOS/Linux
-# we synthesize the copy keystroke with pynput, so pyautogui isn't needed there.
+# Global-hotkey + synthetic-keystroke backend: `pynput` on every platform.
+#   macOS / Linux: needs Accessibility / Input Monitoring permission.
+#   Windows: the low-level hook needs no special permission to *detect* hotkeys
+#            (Administrator is no longer required just for that). Note: sending
+#            the synthetic copy into an already-elevated window still needs admin.
+# Windows previously used the `keyboard` library, but it has been unmaintained
+# since 2020 and forced the whole app to run elevated; pynput unifies the input
+# path. pyautogui is still used only to simulate the copy shortcut on Windows
+# (on macOS/Linux we synthesize the copy keystroke with pynput).
+from pynput import keyboard as pynput_keyboard
 if IS_WINDOWS:
-    import keyboard
     import pyautogui
-else:
-    from pynput import keyboard as pynput_keyboard
 
 # Try to import system tray libraries (optional — script works without them).
 # NOTE: the tray is intentionally disabled on macOS (see main()) because pystray
@@ -139,6 +143,10 @@ DEFAULTS = {
     "hotkey_speed_up": f"{_DEFAULT_MOD}+right",  # Increase speech speed
     "hotkey_speed_down": f"{_DEFAULT_MOD}+left", # Decrease speech speed
     "hotkey_quit": f"{_DEFAULT_MOD}+q",          # Quit
+    # Pause other apps' media (Spotify, video, etc.) while we speak, then resume
+    # when we finish. Windows only (uses the system media controls); a no-op
+    # elsewhere. Set to false to leave other audio playing.
+    "pause_other_media": True,
 }
 
 def load_config():
@@ -167,6 +175,7 @@ KOKORO_VOICE = _config["kokoro_voice"]
 KOKORO_SPEED = _config["kokoro_speed"]
 KOKORO_DEVICE = _config["kokoro_device"]
 PIPER_MODEL = _config["piper_model"]
+PAUSE_OTHER_MEDIA = _config["pause_other_media"]
 
 # Hotkeys (configurable per machine via config.json; defaults set above)
 HOTKEY_READ = _config["hotkey_read"]
@@ -260,6 +269,109 @@ def write_error_log(error):
         f.write(traceback.format_exc() + "\n")
 
 
+# ---------------------------------------------------------------------------
+# Pause other apps' media while we speak (Windows only)
+# ---------------------------------------------------------------------------
+# When we start speaking, pause every app that is *currently playing* (Spotify,
+# a browser video, etc.) and remember which ones we paused; when we finish (or
+# stop, or quit) resume exactly those — so we never un-pause something the user
+# had paused themselves. Uses the Windows System Media Transport Controls (SMTC)
+# via WinRT; no Administrator needed. No-op on macOS/Linux (macOS has no clean
+# per-app pause API — see the project notes).
+_paused_app_ids = []   # apps WE paused, so we can resume only those
+
+# The Windows media-control API lives in winrt, which we import LAZILY (on first
+# use) instead of at startup. Reason: on Windows, importing winrt before torch
+# makes torch's c10.dll fail to initialise — a native DLL load-order conflict.
+# Kokoro loads torch at startup, so by the time we first pause media during a
+# read, torch is already up and winrt loads safely afterwards.
+_MediaManager = None        # filled in by _ensure_media_manager() on first use
+_media_pause_ready = None   # None = not tried yet; True/False after the attempt
+
+
+def _ensure_media_manager():
+    """Import the winrt media API on first use and cache the result.
+    Returns True if media auto-pause is available."""
+    global _MediaManager, _media_pause_ready
+    if _media_pause_ready is not None:
+        return _media_pause_ready
+    if not (IS_WINDOWS and PAUSE_OTHER_MEDIA):
+        _media_pause_ready = False
+        return False
+    try:
+        from winrt.windows.media.control import (
+            GlobalSystemMediaTransportControlsSessionManager as _MM,
+        )
+        _MediaManager = _MM
+        _media_pause_ready = True
+    except Exception:
+        print("Note: media auto-pause is off — install it with: "
+              "py -3.12 -m pip install winrt-Windows.Media.Control")
+        _media_pause_ready = False
+    return _media_pause_ready
+
+_PLAYING_STATUS = 4   # GlobalSystemMediaTransportControlsSessionPlaybackStatus.PLAYING
+
+
+async def _pause_playing_sessions():
+    """Pause every currently-playing session; return the app ids we paused."""
+    mgr = await _MediaManager.request_async()
+    paused = []
+    for session in mgr.get_sessions():
+        try:
+            if int(session.get_playback_info().playback_status) == _PLAYING_STATUS:
+                if await session.try_pause_async():
+                    paused.append(session.source_app_user_model_id)
+        except Exception:
+            pass  # one stubborn app must not block the rest
+    return paused
+
+
+async def _resume_sessions(app_ids):
+    """Resume the sessions whose app id is in app_ids."""
+    wanted = set(app_ids)
+    mgr = await _MediaManager.request_async()
+    for session in mgr.get_sessions():
+        try:
+            if session.source_app_user_model_id in wanted:
+                await session.try_play_async()
+        except Exception:
+            pass
+
+
+def pause_other_media():
+    """Pause other apps' currently-playing media (Windows). Remembers what it paused."""
+    global _paused_app_ids
+    if not _ensure_media_manager():
+        return
+    try:
+        _paused_app_ids = asyncio.run(_pause_playing_sessions())
+        if _paused_app_ids:
+            log(f"Paused other media: {', '.join(_paused_app_ids)}")
+    except Exception as e:
+        log(f"Could not pause other media: {e}")
+        _paused_app_ids = []
+
+
+def resume_other_media():
+    """Resume the media we paused earlier (Windows). Safe to call more than once."""
+    global _paused_app_ids
+    if not _paused_app_ids:
+        return
+    to_resume, _paused_app_ids = _paused_app_ids, []
+    try:
+        asyncio.run(_resume_sessions(to_resume))
+        log(f"Resumed other media: {', '.join(to_resume)}")
+    except Exception as e:
+        log(f"Could not resume other media: {e}")
+
+
+# Safety net: if the program exits any normal way (finish, Esc, quit, Ctrl+C,
+# window close, or an uncaught error), make sure we un-pause whatever we paused.
+# (A hard force-kill / taskkill /F can't run this — nothing can.)
+atexit.register(resume_other_media)
+
+
 def save_preferences():
     """Save current voice and speed back into config.json."""
     try:
@@ -286,13 +398,13 @@ def load_preferences():
 # ---------------------------------------------------------------------------
 # Platform input layer (global hotkeys + synthetic "copy" keystroke)
 # ---------------------------------------------------------------------------
-# Windows uses the `keyboard` library; macOS/Linux use `pynput`. These helpers
-# hide that difference so the rest of the code stays platform-agnostic.
-_pynput_hotkeys = None   # pynput GlobalHotKeys listener (macOS/Linux)
+# All platforms use `pynput`. These helpers keep the rest of the code
+# platform-agnostic (they previously hid a Windows-only `keyboard` path).
+_pynput_hotkeys = None   # pynput GlobalHotKeys listener (all platforms)
 _kb_controller = None    # pynput Controller for synthesizing key presses
 
 def _controller():
-    """Lazily create the pynput keyboard Controller (macOS/Linux)."""
+    """Lazily create the pynput keyboard Controller (all platforms)."""
     global _kb_controller
     if _kb_controller is None:
         _kb_controller = pynput_keyboard.Controller()
@@ -314,23 +426,16 @@ def _pretty_combo(combo):
 def register_hotkeys(specs, esc_callback):
     """Register global hotkeys. `specs` is a list of (combo, callback) pairs.
     `esc_callback` fires when Escape is pressed (it is passed one argument,
-    which it may ignore — matches the `keyboard` library's event signature)."""
+    which it may ignore — kept for backwards compatibility with the call site)."""
     global _pynput_hotkeys
-    if IS_WINDOWS:
-        for combo, cb in specs:
-            keyboard.add_hotkey(combo, cb, suppress=False)
-        keyboard.on_press_key("esc", esc_callback)
-    else:
-        mapping = {_combo_to_pynput(combo): cb for combo, cb in specs}
-        mapping["<esc>"] = lambda: esc_callback(None)
-        _pynput_hotkeys = pynput_keyboard.GlobalHotKeys(mapping)
-        _pynput_hotkeys.start()
+    mapping = {_combo_to_pynput(combo): cb for combo, cb in specs}
+    mapping["<esc>"] = lambda: esc_callback(None)
+    _pynput_hotkeys = pynput_keyboard.GlobalHotKeys(mapping)
+    _pynput_hotkeys.start()
 
 def unregister_hotkeys():
     """Tear down all registered global hotkeys."""
-    if IS_WINDOWS:
-        keyboard.unhook_all()
-    elif _pynput_hotkeys is not None:
+    if _pynput_hotkeys is not None:
         _pynput_hotkeys.stop()
 
 def release_modifiers():
@@ -339,19 +444,15 @@ def release_modifiers():
     callback fires; we send synthetic key-ups so the OS sees a clean copy.
     On macOS we also release Cmd, because the hotkey itself uses Cmd and the
     copy we're about to send is Cmd+C — we want a fresh Cmd press for that."""
-    if IS_WINDOWS:
-        keyboard.release("ctrl")
-        keyboard.release("alt")
-    else:
-        mods = [pynput_keyboard.Key.ctrl, pynput_keyboard.Key.alt,
-                pynput_keyboard.Key.shift]
-        if IS_MAC:
-            mods.append(pynput_keyboard.Key.cmd)
-        for k in mods:
-            try:
-                _controller().release(k)
-            except Exception:
-                pass
+    mods = [pynput_keyboard.Key.ctrl, pynput_keyboard.Key.alt,
+            pynput_keyboard.Key.shift]
+    if IS_MAC:
+        mods.append(pynput_keyboard.Key.cmd)
+    for k in mods:
+        try:
+            _controller().release(k)
+        except Exception:
+            pass
 
 def send_copy():
     """Simulate the platform copy shortcut: Cmd+C on macOS, Ctrl+C elsewhere."""
@@ -945,6 +1046,7 @@ def speak_text(text):
     was_stopped = False
     try:
         update_tray_icon("speaking")
+        pause_other_media()   # pause Spotify/video/etc. while we speak
         play_start_sound()
         log(f'Speaking: "{text[:80]}{"..." if len(text) > 80 else ""}"')
 
@@ -976,6 +1078,7 @@ def speak_text(text):
     finally:
         is_processing = False
         is_speaking = False
+        resume_other_media()  # let Spotify/video/etc. carry on
         update_tray_icon("ready")
         log("(Ready for next command)")
 
@@ -1113,7 +1216,6 @@ def open_region_selector():
     # State for drag tracking
     drag_state = {"start_x": None, "start_y": None, "rect_id": None}
     overlay_closed = False  # Prevents double-closing from multiple handlers
-    esc_hook = [None]       # Holds the keyboard hook reference (list so closures can modify it)
 
     def close_overlay():
         """Safely close the overlay (only runs once, always on tkinter's thread).
@@ -1127,9 +1229,6 @@ def open_region_selector():
         if overlay_closed:
             return
         overlay_closed = True
-        if esc_hook[0] is not None:
-            keyboard.unhook(esc_hook[0])
-            esc_hook[0] = None
         root.withdraw()  # Hide the window immediately (so it's not in screenshots)
         root.quit()      # Tell mainloop to stop (actual destroy happens after mainloop exits)
 
@@ -1191,32 +1290,19 @@ def open_region_selector():
         close_overlay()
         log("OCR capture cancelled.")
 
-    def on_overlay_escape(event):
-        # The keyboard library calls this from a background thread.
-        # Tkinter isn't safe to call from other threads, so we use
-        # root.after() to schedule the close on tkinter's own thread.
-        try:
-            root.after(0, close_overlay)
-        except Exception:
-            pass
-
     canvas.bind("<ButtonPress-1>", on_mouse_down)
     canvas.bind("<B1-Motion>", on_mouse_drag)
     canvas.bind("<ButtonRelease-1>", on_mouse_up)
     root.bind("<Escape>", on_escape)
-    # On Windows, also register a global Esc hook via the `keyboard` library as
-    # a backup that fires even if the overlay loses focus. On macOS/Linux the
-    # overlay grabs focus so the tkinter binding above handles Escape (and the
-    # global pynput Esc hotkey remains active as a further fallback).
-    if IS_WINDOWS:
-        esc_hook[0] = keyboard.on_press_key("esc", on_overlay_escape)
+    # Force keyboard focus onto the overlay so its <Escape> binding reliably
+    # catches the keypress on every platform. overrideredirect/topmost windows
+    # don't always get focus automatically — this is why Windows previously
+    # needed a separate global Esc hook (now removed). The global pynput Esc
+    # hotkey stays registered, but during OCR it's a no-op (nothing is speaking),
+    # so this tkinter binding is what actually cancels the capture.
+    root.focus_force()
 
     root.mainloop()
-
-    # Clean up the keyboard hook if it wasn't already removed by close_overlay
-    if esc_hook[0] is not None:
-        keyboard.unhook(esc_hook[0])
-        esc_hook[0] = None
 
     # Do NOT destroy root here. The _overlay_root reference keeps it alive,
     # preventing garbage collection on a random thread (which causes
@@ -1308,7 +1394,7 @@ def ocr_and_speak(screenshot_image):
 def on_stop(event):
     """Hotkey handler: stop speaking immediately."""
     global is_speaking
-    log(">>> Esc pressed!")  # Always log so we know the keyboard library is working
+    log(">>> Esc pressed!")  # Always log so we know the Esc hotkey is being detected
     if is_speaking:
         is_speaking = False
         play_stop_sound()
@@ -1418,6 +1504,7 @@ def main():
 
     # Cleanup
     unregister_hotkeys()
+    resume_other_media()  # if we quit mid-speech, let other apps resume
     if tray_icon is not None:
         try:
             tray_icon.stop()
